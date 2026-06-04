@@ -1,6 +1,7 @@
 package core.global.entity.image.service.impl;
 
 import core.global.entity.image.S3Props;
+import core.global.entity.image.service.FailedImageCleanupService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.utils.UrlUtil;
 import core.global.enums.errorcode.CommonErrorCode;
@@ -33,6 +34,7 @@ public class S3ImageStorageClient implements ImageStorageClient {
 
     private final S3Client s3Client;
     private final S3Props s3Props;
+    private final FailedImageCleanupService failedImageCleanupService;
 
     @Value("${ncp.s3.bucket}")
     private String bucket;
@@ -51,7 +53,7 @@ public class S3ImageStorageClient implements ImageStorageClient {
         if (filtered.isEmpty()) return;
 
         final int LIMIT = 1000; // S3/NCP 일반 한도
-        for (int i = 0; i < keys.size(); i += LIMIT) {
+        for (int i = 0; i < filtered.size(); i += LIMIT) {
             List<String> chunk = filtered.subList(i, Math.min(i + LIMIT, filtered.size()));
             try {
                 var res = s3Client.deleteObjects(b -> b.bucket(bucket).delete(d -> d.objects(
@@ -63,10 +65,12 @@ public class S3ImageStorageClient implements ImageStorageClient {
                     for (var err : res.errors()) {
                         log.warn("[POST IMG] bulk delete error key={}, code={}, msg={}",
                                 err.key(), err.code(), err.message());
+                        failedImageCleanupService.recordDeleteObject(err.key(), err.message());
                     }
                 }
             } catch (SdkException e) {
                 log.warn("[POST IMG] bulk delete failed size={}, err={}", chunk.size(), e.getMessage());
+                chunk.forEach(key -> failedImageCleanupService.recordDeleteObject(key, e.getMessage()));
             }
         }
     }
@@ -101,12 +105,20 @@ public class S3ImageStorageClient implements ImageStorageClient {
                             .bucket(bucket)
                             .delete(Delete.builder().objects(toDelete).build())
                             .build();
-                    s3Client.deleteObjects(delReq);
+                    var delRes = s3Client.deleteObjects(delReq);
+                    if (delRes != null && delRes.errors() != null && !delRes.errors().isEmpty()) {
+                        for (var err : delRes.errors()) {
+                            log.warn("[POST IMG] folder delete error key={}, code={}, msg={}",
+                                    err.key(), err.code(), err.message());
+                            failedImageCleanupService.recordDeleteObject(err.key(), err.message());
+                        }
+                    }
                 }
 
                 continuation = res.isTruncated() ? res.nextContinuationToken() : null;
             } while (continuation != null);
         } catch (SdkException e) {
+            failedImageCleanupService.recordDeleteFolder(prefix, e.getMessage());
             throw new BusinessException(ImageErrorCode.IMAGE_FOLDER_DELETE_FAILED);
         }
     }
