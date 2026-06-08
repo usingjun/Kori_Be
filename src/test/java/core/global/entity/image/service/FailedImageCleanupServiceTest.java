@@ -32,6 +32,10 @@ class FailedImageCleanupServiceTest {
     private FailedImageCleanupRepository failedImageCleanupRepository;
     @Mock
     private S3Client s3Client;
+    @Mock
+    private ImageCleanupRabbitBridge imageCleanupRabbitBridge;
+    @Mock
+    private ImageCleanupOperationService imageCleanupOperationService;
 
     @InjectMocks
     private FailedImageCleanupService failedImageCleanupService;
@@ -56,6 +60,11 @@ class FailedImageCleanupServiceTest {
         assertThat(saved.getAttemptCount()).isZero();
         assertThat(saved.getLastError()).isEqualTo("timeout");
         assertThat(saved.getNextRetryAt()).isNotNull();
+        verify(imageCleanupRabbitBridge).recordAndPublish(
+                ImageCleanupOperationType.DELETE_OBJECT,
+                "posts/1/a.jpg",
+                "timeout"
+        );
     }
 
     @Test
@@ -79,6 +88,19 @@ class FailedImageCleanupServiceTest {
         assertThat(existing.getAttemptCount()).isZero();
         assertThat(existing.getLastError()).isEqualTo("new error");
         verify(failedImageCleanupRepository, never()).save(any());
+        verify(imageCleanupRabbitBridge).recordAndPublish(
+                ImageCleanupOperationType.DELETE_OBJECT,
+                "posts/1/a.jpg",
+                "new error"
+        );
+    }
+
+    @Test
+    @DisplayName("실패 기록 - default/ key는 fallback과 RabbitMQ에 기록하지 않는다")
+    void recordDeleteObject_ignoresDefaultKey() {
+        failedImageCleanupService.recordDeleteObject("default/profile.png", "timeout");
+
+        verifyNoInteractions(failedImageCleanupRepository, imageCleanupRabbitBridge);
     }
 
     @Test
@@ -102,6 +124,10 @@ class FailedImageCleanupServiceTest {
         assertThat(cleanup.getStatus()).isEqualTo(ImageCleanupStatus.SUCCESS);
         assertThat(cleanup.getLastError()).isNull();
         verify(s3Client).deleteObject(any(Consumer.class));
+        verify(imageCleanupOperationService).markFallbackCompleted(
+                ImageCleanupOperationType.DELETE_OBJECT,
+                "posts/1/a.jpg"
+        );
     }
 
     @Test
@@ -126,5 +152,6 @@ class FailedImageCleanupServiceTest {
         assertThat(cleanup.getAttemptCount()).isEqualTo(1);
         assertThat(cleanup.getLastError()).isEqualTo("s3 down");
         assertThat(cleanup.getNextRetryAt()).isNotNull();
+        verifyNoInteractions(imageCleanupOperationService);
     }
 }

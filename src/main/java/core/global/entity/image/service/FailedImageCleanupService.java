@@ -28,6 +28,8 @@ public class FailedImageCleanupService {
 
     private final FailedImageCleanupRepository failedImageCleanupRepository;
     private final S3Client s3Client;
+    private final ImageCleanupRabbitBridge imageCleanupRabbitBridge;
+    private final ImageCleanupOperationService imageCleanupOperationService;
 
     @Value("${ncp.s3.bucket}")
     private String bucket;
@@ -61,8 +63,12 @@ public class FailedImageCleanupService {
             // This keeps the S3 call inside the transaction, so lock time can grow if S3 is slow.
             cleanup.markProcessing();
             try {
-                executeCleanup(cleanup);
+                executeCleanup(cleanup.getOperationType(), cleanup.getTargetKey());
                 cleanup.markSuccess();
+                imageCleanupOperationService.markFallbackCompleted(
+                        cleanup.getOperationType(),
+                        cleanup.getTargetKey()
+                );
                 processed++;
             } catch (Exception e) {
                 cleanup.markFailed(e.getMessage());
@@ -81,6 +87,9 @@ public class FailedImageCleanupService {
         if (targetKey == null || targetKey.isBlank()) {
             return;
         }
+        if (targetKey.startsWith("default/")) {
+            return;
+        }
 
         failedImageCleanupRepository.findByOperationTypeAndTargetKey(operationType, targetKey)
                 .ifPresentOrElse(
@@ -89,20 +98,25 @@ public class FailedImageCleanupService {
                                 FailedImageCleanup.create(operationType, targetKey, errorMessage)
                         )
                 );
+        imageCleanupRabbitBridge.recordAndPublish(operationType, targetKey, errorMessage);
     }
 
-    private void executeCleanup(FailedImageCleanup cleanup) {
-        if (cleanup.getOperationType() == ImageCleanupOperationType.DELETE_OBJECT) {
-            deleteObject(cleanup.getTargetKey());
+    public void executeCleanup(ImageCleanupOperationType operationType, String targetKey) {
+        if (targetKey == null || targetKey.isBlank() || targetKey.startsWith("default/")) {
             return;
         }
 
-        if (cleanup.getOperationType() == ImageCleanupOperationType.DELETE_FOLDER) {
-            deleteFolder(cleanup.getTargetKey());
+        if (operationType == ImageCleanupOperationType.DELETE_OBJECT) {
+            deleteObject(targetKey);
             return;
         }
 
-        throw new IllegalStateException("Unsupported image cleanup operation: " + cleanup.getOperationType());
+        if (operationType == ImageCleanupOperationType.DELETE_FOLDER) {
+            deleteFolder(targetKey);
+            return;
+        }
+
+        throw new IllegalStateException("Unsupported image cleanup operation: " + operationType);
     }
 
     private void deleteObject(String key) {
