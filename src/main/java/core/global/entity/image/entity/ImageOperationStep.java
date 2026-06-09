@@ -153,8 +153,10 @@ public class ImageOperationStep {
 
     public void markCompletedWithoutResult() {
         if (status == ImageOperationStepStatus.COMPLETED) return;
-        if (status != ImageOperationStepStatus.PROCESSING) {
-            throw new IllegalStateException("Image operation step must be PROCESSING before completion");
+        if (status != ImageOperationStepStatus.PROCESSING
+                && status != ImageOperationStepStatus.RETRY_WAITING
+                && status != ImageOperationStepStatus.DLQ) {
+            throw new IllegalStateException("Recoverable image operation step cannot complete from status " + status);
         }
         LocalDateTime now = LocalDateTime.now();
         status = ImageOperationStepStatus.COMPLETED;

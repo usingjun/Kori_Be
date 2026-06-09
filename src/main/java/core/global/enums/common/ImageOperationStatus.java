@@ -5,6 +5,7 @@ public enum ImageOperationStatus {
     PROCESSING,
     RETRY_WAITING,
     COMPLETED,
+    COMPENSATED,
     FAILED,
     DLQ
 }

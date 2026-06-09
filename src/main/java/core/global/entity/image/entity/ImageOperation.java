@@ -102,7 +102,9 @@ public class ImageOperation {
     }
 
     public void markFailed() {
-        if (status == ImageOperationStatus.COMPLETED || status == ImageOperationStatus.DLQ) {
+        if (status == ImageOperationStatus.COMPLETED
+                || status == ImageOperationStatus.COMPENSATED
+                || status == ImageOperationStatus.DLQ) {
             throw new IllegalStateException("Terminal image operation cannot fail");
         }
         status = ImageOperationStatus.FAILED;
@@ -110,11 +112,22 @@ public class ImageOperation {
     }
 
     public void markDlq() {
-        if (status == ImageOperationStatus.COMPLETED) {
-            throw new IllegalStateException("Completed image operation cannot move to DLQ");
+        if (status == ImageOperationStatus.COMPLETED || status == ImageOperationStatus.COMPENSATED) {
+            throw new IllegalStateException("Terminal image operation cannot move to DLQ");
         }
         status = ImageOperationStatus.DLQ;
         updatedAt = LocalDateTime.now();
+    }
+
+    public void markCompensated() {
+        if (status == ImageOperationStatus.COMPENSATED) return;
+        if (status != ImageOperationStatus.FAILED && status != ImageOperationStatus.DLQ) {
+            throw new IllegalStateException("Image operation must be FAILED or DLQ before compensation");
+        }
+        LocalDateTime now = LocalDateTime.now();
+        status = ImageOperationStatus.COMPENSATED;
+        completedAt = now;
+        updatedAt = now;
     }
 
 }

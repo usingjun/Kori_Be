@@ -15,6 +15,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
+import java.util.List;
 import java.util.UUID;
 
 @Service
@@ -72,7 +74,9 @@ public class ImageOperationRecoveryService {
         if (consumedMessageRepository.existsById(message.messageId())) {
             return;
         }
-        findMatchingStep(message).markCompletedWithoutResult();
+        ImageOperationStep step = findMatchingStep(message);
+        step.markCompletedWithoutResult();
+        operationRepository.findById(message.operationId()).orElseThrow().markCompensated();
         consumedMessageRepository.insertIfAbsent(
                 message.messageId(),
                 message.operationId(),
@@ -103,6 +107,28 @@ public class ImageOperationRecoveryService {
             operationRepository.findById(message.operationId()).orElseThrow().markDlq();
         }
         return new FailureDecision(exhausted, step.getAttemptCount());
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public int recoverTimedOutCompensations(LocalDateTime timedOutBefore) {
+        List<ImageOperationStep> timedOutSteps =
+                stepRepository.findTop50ByStepTypeAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepStatus.PROCESSING,
+                        timedOutBefore
+                );
+
+        for (ImageOperationStep step : timedOutSteps) {
+            boolean exhausted = step.markFailed("Compensation processing timeout");
+            ImageOperationMessageDestination destination = exhausted
+                    ? ImageOperationMessageDestination.DLQ
+                    : ImageOperationMessageDestination.RETRY;
+            outboxRepository.save(outbox(step, step.getAttemptCount(), destination));
+            if (exhausted) {
+                operationRepository.findById(step.getOperationId()).orElseThrow().markDlq();
+            }
+        }
+        return timedOutSteps.size();
     }
 
     private ImageOperationStep findMatchingStep(ImageOperationMessageView message) {
