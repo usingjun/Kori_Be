@@ -4,9 +4,14 @@ import core.global.entity.image.dto.ImageDto;
 import core.global.entity.image.dto.ImageModerationEvent;
 import core.global.entity.image.entity.Image;
 import core.global.entity.image.repository.ImageRepository;
+import core.global.entity.image.service.ImageCopyExecutor;
+import core.global.entity.image.service.ImageOperationService;
+import core.global.entity.image.service.ImageOperationStepService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.service.ProfileImageService;
 import core.global.enums.ImageModerationStatus;
+import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageOperationType;
 import core.global.enums.common.ImageType;
 import core.global.enums.errorcode.ImageErrorCode;
 import core.global.exception.BusinessException;
@@ -16,6 +21,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 import software.amazon.awssdk.core.exception.SdkException;
@@ -46,6 +53,9 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     private final ImageRepository imageRepository;
     private final ImageStorageClient storageClient;
     private final ApplicationEventPublisher eventPublisher;
+    private final ImageOperationService imageOperationService;
+    private final ImageOperationStepService imageOperationStepService;
+    private final ImageCopyExecutor imageCopyExecutor;
 
     @Value("${ncp.s3.bucket}")
     private String bucket;
@@ -119,7 +129,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
                 requestInfo.isDefaultIncoming(), requestInfo.isStaging(), requestInfo.getReqKey());
 
         // 3) 용량 및 헤더 검증
-        validateImageHeadIfNecessary(requestInfo);
+        HeadObjectResponse sourceHead = validateImageHeadIfNecessary(requestInfo);
 
         // 4) 기존 이미지 조회
         Optional<Image> existingOpt =
@@ -137,19 +147,29 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             return candidateFinalUrl;
         }
 
-        // 7) 기존 S3 삭제
-        deleteOldS3ImageIfNecessary(userId, existingOpt);
+        ImageOperationService.CopyOperationPlan copyPlan = null;
+        String finalKey = candidateFinalKey;
+        String oldKey = existingOpt
+                .map(Image::getUrl)
+                .filter(url -> !storageClient.isDefaultUrlOrKey(url))
+                .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
+                .orElse(null);
+        if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
+            copyPlan = copyProfileImage(userId, requestInfo, candidateFinalKey, sourceHead);
+            finalKey = copyPlan.targetKey();
+        }
 
-        // 8) 기존 DB 삭제 (Flush 포함)
-        imageRepository.deleteByImageTypeAndRelatedIdWithFlushing(ImageType.USER, userId);
-        log.info("[프로필 수정 - DB 초기화] 기존 이미지 레코드 삭제 완료 (Flush)");
+        String resultUrl;
+        try {
+            resultUrl = upsertProfileImageAndFlush(userId, existingOpt, finalKey);
+        } catch (RuntimeException e) {
+            if (copyPlan != null) {
+                createCompensation(copyPlan, finalKey);
+            }
+            throw e;
+        }
 
-        // 9) staging -> 영구 이동
-        String finalKey = moveStagingProfileIfNecessary(userId, requestInfo, candidateFinalKey);
-        log.info("[프로필 수정 - 이동 완료] 최종 확정된 Key: {}", finalKey);
-
-        // 10) 저장 및 결과 반환
-        String resultUrl = saveImageInDB(userId, ImageType.USER, finalKey);
+        scheduleCleanupAfterCommit(oldKey, requestInfo, finalKey, copyPlan);
         log.info("[프로필 수정 종료] 성공적으로 변경되었습니다. finalUrl: {}", resultUrl);
 
         return resultUrl;
@@ -367,16 +387,16 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         return reqKey;
     }
 
-    private void validateImageHeadIfNecessary(RequestInfo requestInfo) {
+    private HeadObjectResponse validateImageHeadIfNecessary(RequestInfo requestInfo) {
         if (requestInfo.isDefaultIncoming()) {
             log.info("[헤더검사 - skip] 기본 이미지이므로 헤더 검사를 생략합니다.");
-            return;
+            return null;
         }
         log.info("[헤더검사 - 시작] Key: {}", requestInfo.getReqKey());
-        validateImageHeadOrThrow(requestInfo.getReqKey(), PROFILE_MAX_BYTES);
+        return validateImageHeadOrThrow(requestInfo.getReqKey(), PROFILE_MAX_BYTES);
     }
 
-    private void validateImageHeadOrThrow(String key, long maxBytes) {
+    private HeadObjectResponse validateImageHeadOrThrow(String key, long maxBytes) {
         HeadObjectResponse head = storageClient.headObject(key);
         long size = head.contentLength();
         String ct = Optional.ofNullable(head.contentType()).orElse("").toLowerCase();
@@ -392,6 +412,122 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             throw new BusinessException(ImageErrorCode.IMAGE_FILE_UPLOAD_TYPE_ERROR);
         }
         log.info("[헤더검사 성공]");
+        return head;
+    }
+
+    private ImageOperationService.CopyOperationPlan copyProfileImage(
+            Long userId,
+            RequestInfo requestInfo,
+            String targetKey,
+            HeadObjectResponse sourceHead
+    ) {
+        ImageOperationService.CopyOperationPlan plan = imageOperationService.createCopyOperation(
+                ImageOperationType.UPDATE_USER_PROFILE_IMAGE,
+                ImageOperationOwnerType.USER,
+                userId,
+                requestInfo.getReqKey(),
+                targetKey,
+                sourceHead == null ? null : sourceHead.eTag(),
+                sourceHead == null ? null : sourceHead.contentLength()
+        );
+        imageOperationService.markProcessing(plan.operationId());
+        imageOperationStepService.markProcessing(plan.stepId());
+
+        try {
+            ImageCopyExecutor.ImageCopyResult result =
+                    imageCopyExecutor.copyProfile(requestInfo.getReqKey(), plan.targetKey());
+            imageOperationStepService.markCompleted(plan.stepId(), result.resultETag());
+            return plan;
+        } catch (RuntimeException e) {
+            ImageOperationStepService.FailureDecision decision =
+                    imageOperationStepService.markFailed(plan.stepId(), e.getMessage());
+            if (decision.exhausted()) {
+                imageOperationService.markDlq(plan.operationId());
+            } else {
+                imageOperationService.markRetryWaiting(plan.operationId());
+            }
+            throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
+        }
+    }
+
+    private void scheduleCleanupAfterCommit(
+            String previousKey,
+            RequestInfo requestInfo,
+            String finalKey,
+            ImageOperationService.CopyOperationPlan copyPlan
+    ) {
+        String oldKey = java.util.Objects.equals(previousKey, finalKey) ? null : previousKey;
+        String stagingKey = requestInfo.isStaging() ? requestInfo.getReqKey() : null;
+
+        Runnable cleanup = () -> {
+            try {
+                storageClient.deleteObjectsBulk(
+                        java.util.stream.Stream.of(oldKey, stagingKey)
+                                .filter(java.util.Objects::nonNull)
+                                .distinct()
+                                .toList()
+                );
+            } catch (RuntimeException e) {
+                log.error("[UPI] post-commit cleanup invocation failed oldKey={} stagingKey={}",
+                        oldKey, stagingKey, e);
+            }
+            if (copyPlan != null) {
+                try {
+                    imageOperationService.markCompleted(copyPlan.operationId());
+                } catch (RuntimeException e) {
+                    log.error("[UPI] operation completion record failed operationId={}",
+                            copyPlan.operationId(), e);
+                }
+            }
+        };
+
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            cleanup.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                cleanup.run();
+            }
+
+            @Override
+            public void afterCompletion(int status) {
+                if (status != TransactionSynchronization.STATUS_COMMITTED && copyPlan != null) {
+                    createCompensation(copyPlan, finalKey);
+                }
+            }
+        });
+    }
+
+    private String upsertProfileImageAndFlush(
+            Long userId,
+            Optional<Image> existingOpt,
+            String finalKey
+    ) {
+        String finalUrl = buildCdnUrlFromKey(cdnBaseUrl, finalKey);
+        if (existingOpt.isPresent()) {
+            existingOpt.get().updateUrl(finalUrl);
+        } else {
+            imageRepository.save(
+                    Image.of(ImageType.USER, userId, finalUrl, 0, ImageModerationStatus.CLEAN, null)
+            );
+        }
+        imageRepository.flush();
+        return finalUrl;
+    }
+
+    private void createCompensation(
+            ImageOperationService.CopyOperationPlan copyPlan,
+            String finalKey
+    ) {
+        try {
+            imageOperationStepService.createCompensationStep(copyPlan.operationId(), finalKey);
+            imageOperationService.markFailed(copyPlan.operationId());
+        } catch (RuntimeException compensationError) {
+            log.error("[UPI] compensation record failed operationId={} targetKey={}",
+                    copyPlan.operationId(), finalKey, compensationError);
+        }
     }
 
     private boolean isNoOp(Optional<Image> existingOpt, String candidateFinalUrl) {

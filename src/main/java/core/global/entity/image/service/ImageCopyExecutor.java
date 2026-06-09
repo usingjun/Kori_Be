@@ -26,7 +26,23 @@ public class ImageCopyExecutor {
                 .acl(ObjectCannedACL.PUBLIC_READ)
                 .metadataDirective(MetadataDirective.COPY)
         );
+        return validateResponse(targetKey, response);
+    }
 
+    public ImageCopyResult copyProfile(String sourceKey, String targetKey) {
+        CopyObjectResponse response = s3Client.copyObject(b -> b
+                .sourceBucket(bucket)
+                .sourceKey(sourceKey)
+                .destinationBucket(bucket)
+                .destinationKey(targetKey)
+                .acl(ObjectCannedACL.PUBLIC_READ)
+                .metadataDirective(MetadataDirective.REPLACE)
+                .cacheControl("public, max-age=31536000, immutable")
+        );
+        return validateResponse(targetKey, response);
+    }
+
+    private ImageCopyResult validateResponse(String targetKey, CopyObjectResponse response) {
         if (response == null
                 || response.sdkHttpResponse() == null
                 || !response.sdkHttpResponse().isSuccessful()

@@ -18,6 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 @ExtendWith(MockitoExtension.class)
 class ImageOperationServiceTest {
@@ -56,5 +57,36 @@ class ImageOperationServiceTest {
         assertThat(stepCaptor.getValue().getOperationId()).isEqualTo(plan.operationId());
         assertThat(stepCaptor.getValue().getTargetKey()).isEqualTo(plan.targetKey());
         assertThat(stepCaptor.getValue().getSourceContentLength()).isEqualTo(1024L);
+    }
+
+    @Test
+    @DisplayName("재시도 대기 중인 operation은 다시 PROCESSING으로 진입할 수 있다")
+    void operation_canRestartAfterRetryWaiting() {
+        ImageOperation operation = ImageOperation.create(
+                ImageOperationType.UPDATE_USER_PROFILE_IMAGE,
+                ImageOperationOwnerType.USER,
+                10L
+        );
+        operation.markProcessing();
+        operation.markRetryWaiting();
+
+        assertThatCode(operation::markProcessing).doesNotThrowAnyException();
+        assertThat(operation.getStatus()).isEqualTo(core.global.enums.common.ImageOperationStatus.PROCESSING);
+    }
+
+    @Test
+    @DisplayName("재시도 한도를 소진한 operation은 DLQ로 전환한다")
+    void markDlq_movesOperationToDlq() {
+        ImageOperation operation = ImageOperation.create(
+                ImageOperationType.UPDATE_USER_PROFILE_IMAGE,
+                ImageOperationOwnerType.USER,
+                10L
+        );
+        operation.markProcessing();
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(java.util.Optional.of(operation));
+
+        operationService.markDlq(operation.getOperationId());
+
+        assertThat(operation.getStatus()).isEqualTo(core.global.enums.common.ImageOperationStatus.DLQ);
     }
 }

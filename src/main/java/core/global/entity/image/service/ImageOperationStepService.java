@@ -17,7 +17,7 @@ public class ImageOperationStepService {
 
     private final ImageOperationStepRepository stepRepository;
 
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public ImageOperationStep createCompensationStep(UUID operationId, String targetKey) {
         return stepRepository.save(
                 ImageOperationStep.createCompensationStep(

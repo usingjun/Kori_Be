@@ -13,6 +13,8 @@ import software.amazon.awssdk.http.SdkHttpResponse;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
 import software.amazon.awssdk.services.s3.model.CopyObjectResult;
+import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
+import software.amazon.awssdk.services.s3.model.MetadataDirective;
 
 import java.util.function.Consumer;
 
@@ -22,6 +24,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
+import org.mockito.ArgumentCaptor;
 
 @ExtendWith(MockitoExtension.class)
 class ImageCopyExecutorTest {
@@ -70,5 +73,25 @@ class ImageCopyExecutorTest {
 
         assertThatThrownBy(() -> executor.copy("temp/session/a.jpg", "posts/1/a.jpg"))
                 .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    @DisplayName("프로필 Copy는 기존 cache-control 정책을 유지한다")
+    void copyProfile_preservesProfileMetadataPolicy() {
+        when(response.sdkHttpResponse())
+                .thenReturn(SdkHttpResponse.builder().statusCode(HttpStatus.OK.value()).build());
+        when(response.copyObjectResult()).thenReturn(copyObjectResult);
+        when(copyObjectResult.eTag()).thenReturn("\"result-etag\"");
+        when(s3Client.copyObject(any(Consumer.class))).thenReturn(response);
+
+        executor.copyProfile("temp/profile.jpg", "users/10/profile.jpg");
+
+        ArgumentCaptor<Consumer<CopyObjectRequest.Builder>> captor = ArgumentCaptor.forClass(Consumer.class);
+        verify(s3Client).copyObject(captor.capture());
+        CopyObjectRequest.Builder builder = CopyObjectRequest.builder();
+        captor.getValue().accept(builder);
+        CopyObjectRequest request = builder.build();
+        assertThat(request.metadataDirective()).isEqualTo(MetadataDirective.REPLACE);
+        assertThat(request.cacheControl()).isEqualTo("public, max-age=31536000, immutable");
     }
 }

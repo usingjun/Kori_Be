@@ -75,7 +75,9 @@ public class ImageOperation {
     }
 
     public void markProcessing() {
-        requireStatus(ImageOperationStatus.PENDING);
+        if (status != ImageOperationStatus.PENDING && status != ImageOperationStatus.RETRY_WAITING) {
+            throw new IllegalStateException("Image operation cannot start from status " + status);
+        }
         status = ImageOperationStatus.PROCESSING;
         updatedAt = LocalDateTime.now();
     }
@@ -89,6 +91,14 @@ public class ImageOperation {
         status = ImageOperationStatus.COMPLETED;
         completedAt = now;
         updatedAt = now;
+    }
+
+    public void markRetryWaiting() {
+        if (status != ImageOperationStatus.PROCESSING) {
+            throw new IllegalStateException("Image operation must be PROCESSING before retry waiting");
+        }
+        status = ImageOperationStatus.RETRY_WAITING;
+        updatedAt = LocalDateTime.now();
     }
 
     public void markFailed() {
@@ -107,9 +117,4 @@ public class ImageOperation {
         updatedAt = LocalDateTime.now();
     }
 
-    private void requireStatus(ImageOperationStatus expected) {
-        if (status != expected) {
-            throw new IllegalStateException("Expected image operation status " + expected + " but was " + status);
-        }
-    }
 }
