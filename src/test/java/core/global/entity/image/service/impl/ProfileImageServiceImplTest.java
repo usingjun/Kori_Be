@@ -55,6 +55,8 @@ class ProfileImageServiceImplTest {
     @Mock
     private ImageOperationStepService imageOperationStepService;
     @Mock
+    private ImageOperationRecoveryService imageOperationRecoveryService;
+    @Mock
     private ImageCopyExecutor imageCopyExecutor;
 
     @InjectMocks
@@ -115,14 +117,12 @@ class ProfileImageServiceImplTest {
         reset(imageCopyExecutor);
         doThrow(new IllegalStateException("copy failed"))
                 .when(imageCopyExecutor).copyProfile(SOURCE_KEY, TARGET_KEY);
-        when(imageOperationStepService.markFailed(stepId, "copy failed"))
-                .thenReturn(new ImageOperationStepService.FailureDecision(false, 1));
-
         assertThatThrownBy(() -> profileImageService.updateUserProfileImage(USER_ID, SOURCE_KEY))
                 .isInstanceOf(BusinessException.class);
 
         assertThat(existingImage.getUrl()).isEqualTo(CDN_BASE_URL + "/" + OLD_KEY);
-        verify(imageOperationService).markRetryWaiting(operationId);
+        verify(imageOperationStepService).markTerminalFailed(stepId, "copy failed");
+        verify(imageOperationService).markFailed(operationId);
         verify(imageRepository, never()).flush();
         verify(storageClient, never()).deleteObjectsBulk(anyList());
     }
@@ -137,8 +137,7 @@ class ProfileImageServiceImplTest {
         assertThatThrownBy(() -> profileImageService.updateUserProfileImage(USER_ID, SOURCE_KEY))
                 .isInstanceOf(DataAccessResourceFailureException.class);
 
-        verify(imageOperationStepService).createCompensationStep(operationId, TARGET_KEY);
-        verify(imageOperationService).markFailed(operationId);
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, TARGET_KEY);
         verify(storageClient, never()).deleteObjectsBulk(anyList());
     }
 
@@ -155,8 +154,7 @@ class ProfileImageServiceImplTest {
                     .forEach(synchronization ->
                             synchronization.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK));
 
-            verify(imageOperationStepService).createCompensationStep(operationId, TARGET_KEY);
-            verify(imageOperationService).markFailed(operationId);
+            verify(imageOperationRecoveryService).scheduleCompensation(operationId, TARGET_KEY);
             verify(imageOperationService, never()).markCompleted(operationId);
         } finally {
             TransactionSynchronizationManager.clearSynchronization();

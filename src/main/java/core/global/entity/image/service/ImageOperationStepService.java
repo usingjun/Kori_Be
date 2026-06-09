@@ -45,6 +45,11 @@ public class ImageOperationStepService {
         return new FailureDecision(exhausted, step.getAttemptCount());
     }
 
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void markTerminalFailed(UUID stepId, String errorMessage) {
+        find(stepId).markTerminalFailed(errorMessage);
+    }
+
     private ImageOperationStep find(UUID stepId) {
         return stepRepository.findById(stepId).orElseThrow();
     }

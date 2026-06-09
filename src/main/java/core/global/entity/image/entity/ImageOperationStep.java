@@ -151,6 +151,18 @@ public class ImageOperationStep {
         updatedAt = now;
     }
 
+    public void markCompletedWithoutResult() {
+        if (status == ImageOperationStepStatus.COMPLETED) return;
+        if (status != ImageOperationStepStatus.PROCESSING) {
+            throw new IllegalStateException("Image operation step must be PROCESSING before completion");
+        }
+        LocalDateTime now = LocalDateTime.now();
+        status = ImageOperationStepStatus.COMPLETED;
+        lastError = null;
+        completedAt = now;
+        updatedAt = now;
+    }
+
     public boolean markFailed(String errorMessage) {
         if (status != ImageOperationStepStatus.PROCESSING) {
             throw new IllegalStateException("Copy step must be PROCESSING before failure");
@@ -164,6 +176,16 @@ public class ImageOperationStep {
         }
         status = ImageOperationStepStatus.RETRY_WAITING;
         return false;
+    }
+
+    public void markTerminalFailed(String errorMessage) {
+        if (status != ImageOperationStepStatus.PROCESSING) {
+            throw new IllegalStateException("Image operation step must be PROCESSING before terminal failure");
+        }
+        attemptCount++;
+        lastError = trimError(errorMessage);
+        status = ImageOperationStepStatus.FAILED;
+        updatedAt = LocalDateTime.now();
     }
 
     private static String requireText(String value, String fieldName) {

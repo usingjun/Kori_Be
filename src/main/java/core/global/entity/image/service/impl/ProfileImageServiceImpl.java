@@ -6,6 +6,7 @@ import core.global.entity.image.entity.Image;
 import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageCopyExecutor;
 import core.global.entity.image.service.ImageOperationService;
+import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.entity.image.service.ImageOperationStepService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.service.ProfileImageService;
@@ -55,6 +56,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     private final ApplicationEventPublisher eventPublisher;
     private final ImageOperationService imageOperationService;
     private final ImageOperationStepService imageOperationStepService;
+    private final ImageOperationRecoveryService imageOperationRecoveryService;
     private final ImageCopyExecutor imageCopyExecutor;
 
     @Value("${ncp.s3.bucket}")
@@ -439,13 +441,8 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             imageOperationStepService.markCompleted(plan.stepId(), result.resultETag());
             return plan;
         } catch (RuntimeException e) {
-            ImageOperationStepService.FailureDecision decision =
-                    imageOperationStepService.markFailed(plan.stepId(), e.getMessage());
-            if (decision.exhausted()) {
-                imageOperationService.markDlq(plan.operationId());
-            } else {
-                imageOperationService.markRetryWaiting(plan.operationId());
-            }
+            imageOperationStepService.markTerminalFailed(plan.stepId(), e.getMessage());
+            imageOperationService.markFailed(plan.operationId());
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
     }
@@ -522,8 +519,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             String finalKey
     ) {
         try {
-            imageOperationStepService.createCompensationStep(copyPlan.operationId(), finalKey);
-            imageOperationService.markFailed(copyPlan.operationId());
+            imageOperationRecoveryService.scheduleCompensation(copyPlan.operationId(), finalKey);
         } catch (RuntimeException compensationError) {
             log.error("[UPI] compensation record failed operationId={} targetKey={}",
                     copyPlan.operationId(), finalKey, compensationError);

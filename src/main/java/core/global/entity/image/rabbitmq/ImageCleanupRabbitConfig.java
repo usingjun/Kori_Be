@@ -59,6 +59,36 @@ public class ImageCleanupRabbitConfig {
     }
 
     @Bean
+    public Queue imageOperationStepQueue() {
+        return QueueBuilder.durable(ImageOperationRabbitNames.STEP_QUEUE).build();
+    }
+
+    @Bean
+    public Queue imageOperationStepRetry1mQueue() {
+        return retryQueue(ImageOperationRabbitNames.STEP_RETRY_1M_QUEUE, 60_000);
+    }
+
+    @Bean
+    public Queue imageOperationStepRetry5mQueue() {
+        return retryQueue(ImageOperationRabbitNames.STEP_RETRY_5M_QUEUE, 300_000);
+    }
+
+    @Bean
+    public Queue imageOperationStepRetry15mQueue() {
+        return retryQueue(ImageOperationRabbitNames.STEP_RETRY_15M_QUEUE, 900_000);
+    }
+
+    @Bean
+    public Queue imageOperationStepRetry1hQueue() {
+        return retryQueue(ImageOperationRabbitNames.STEP_RETRY_1H_QUEUE, 3_600_000);
+    }
+
+    @Bean
+    public Queue imageOperationStepDlq() {
+        return QueueBuilder.durable(ImageOperationRabbitNames.STEP_DLQ).build();
+    }
+
+    @Bean
     public Binding imageCleanupBinding() {
         return BindingBuilder.bind(imageOperationQueue()).to(imageOperationExchange()).with("image.cleanup.*");
     }
@@ -91,6 +121,55 @@ public class ImageCleanupRabbitConfig {
     @Bean
     public Binding imageDlqBinding() {
         return BindingBuilder.bind(imageOperationDlq()).to(imageOperationDlx()).with(DLQ_ROUTING_KEY);
+    }
+
+    @Bean
+    public Binding imageOperationStepBinding() {
+        return BindingBuilder.bind(imageOperationStepQueue())
+                .to(imageOperationExchange())
+                .with(ImageOperationRabbitNames.COMPENSATE_ROUTING_KEY);
+    }
+
+    @Bean
+    public Binding imageOperationStepRetryReturnBinding() {
+        return BindingBuilder.bind(imageOperationStepQueue())
+                .to(imageOperationExchange())
+                .with(ImageOperationRabbitNames.STEP_RETRY_PREFIX + "*");
+    }
+
+    @Bean
+    public Binding imageOperationStepRetry1mBinding() {
+        return BindingBuilder.bind(imageOperationStepRetry1mQueue())
+                .to(imageOperationRetryExchange())
+                .with(ImageOperationRabbitNames.STEP_RETRY_PREFIX + "1m");
+    }
+
+    @Bean
+    public Binding imageOperationStepRetry5mBinding() {
+        return BindingBuilder.bind(imageOperationStepRetry5mQueue())
+                .to(imageOperationRetryExchange())
+                .with(ImageOperationRabbitNames.STEP_RETRY_PREFIX + "5m");
+    }
+
+    @Bean
+    public Binding imageOperationStepRetry15mBinding() {
+        return BindingBuilder.bind(imageOperationStepRetry15mQueue())
+                .to(imageOperationRetryExchange())
+                .with(ImageOperationRabbitNames.STEP_RETRY_PREFIX + "15m");
+    }
+
+    @Bean
+    public Binding imageOperationStepRetry1hBinding() {
+        return BindingBuilder.bind(imageOperationStepRetry1hQueue())
+                .to(imageOperationRetryExchange())
+                .with(ImageOperationRabbitNames.STEP_RETRY_PREFIX + "1h");
+    }
+
+    @Bean
+    public Binding imageOperationStepDlqBinding() {
+        return BindingBuilder.bind(imageOperationStepDlq())
+                .to(imageOperationDlx())
+                .with(ImageOperationRabbitNames.STEP_DLQ_ROUTING_KEY);
     }
 
     @Bean
