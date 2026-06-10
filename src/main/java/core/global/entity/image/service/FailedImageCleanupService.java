@@ -28,7 +28,7 @@ public class FailedImageCleanupService {
 
     private final FailedImageCleanupRepository failedImageCleanupRepository;
     private final S3Client s3Client;
-    private final ImageCleanupRabbitBridge imageCleanupRabbitBridge;
+    private final ImageCleanupOperationBridge imageCleanupOperationBridge;
     private final ImageCleanupOperationService imageCleanupOperationService;
 
     @Value("${ncp.s3.bucket}")
@@ -91,14 +91,16 @@ public class FailedImageCleanupService {
             return;
         }
 
-        failedImageCleanupRepository.findByOperationTypeAndTargetKey(operationType, targetKey)
-                .ifPresentOrElse(
-                        existing -> existing.refreshFailure(errorMessage),
-                        () -> failedImageCleanupRepository.save(
-                                FailedImageCleanup.create(operationType, targetKey, errorMessage)
-                        )
-                );
-        imageCleanupRabbitBridge.recordAndPublish(operationType, targetKey, errorMessage);
+        FailedImageCleanup cleanup = failedImageCleanupRepository
+                .findByOperationTypeAndTargetKey(operationType, targetKey)
+                .map(existing -> {
+                    existing.refreshFailure(errorMessage);
+                    return existing;
+                })
+                .orElseGet(() -> failedImageCleanupRepository.save(
+                        FailedImageCleanup.create(operationType, targetKey, errorMessage)
+                ));
+        imageCleanupOperationBridge.recordCommonOutbox(cleanup.getId(), operationType, targetKey);
     }
 
     public void executeCleanup(ImageCleanupOperationType operationType, String targetKey) {

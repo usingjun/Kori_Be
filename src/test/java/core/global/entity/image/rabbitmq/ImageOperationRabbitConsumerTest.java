@@ -2,6 +2,8 @@ package core.global.entity.image.rabbitmq;
 
 import core.global.entity.image.service.ImageObjectDeleteExecutor;
 import core.global.entity.image.service.ImageOperationRecoveryService;
+import core.global.entity.image.service.FailedImageCleanupService;
+import core.global.enums.common.ImageCleanupOperationType;
 import core.global.enums.common.ImageOperationStepType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -22,6 +24,8 @@ class ImageOperationRabbitConsumerTest {
     private ImageOperationRecoveryService recoveryService;
     @Mock
     private ImageObjectDeleteExecutor objectDeleteExecutor;
+    @Mock
+    private FailedImageCleanupService failedImageCleanupService;
 
     @InjectMocks
     private ImageOperationRabbitConsumer consumer;
@@ -47,6 +51,21 @@ class ImageOperationRabbitConsumerTest {
 
         verify(objectDeleteExecutor).deleteObject(message.targetKey());
         verify(recoveryService).markCompleted(any());
+    }
+
+    @Test
+    void consume_deletesCleanupFolderAndCompletesStep() {
+        ImageOperationMessage message = message(ImageOperationStepType.DELETE_FOLDER);
+        when(recoveryService.begin(any())).thenReturn(true);
+
+        consumer.consume(message);
+
+        verify(failedImageCleanupService).executeCleanup(
+                ImageCleanupOperationType.DELETE_FOLDER,
+                message.targetKey()
+        );
+        verify(recoveryService).markCompleted(any());
+        verifyNoInteractions(objectDeleteExecutor);
     }
 
     @Test

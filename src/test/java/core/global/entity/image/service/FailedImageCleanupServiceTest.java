@@ -33,7 +33,7 @@ class FailedImageCleanupServiceTest {
     @Mock
     private S3Client s3Client;
     @Mock
-    private ImageCleanupRabbitBridge imageCleanupRabbitBridge;
+    private ImageCleanupOperationBridge imageCleanupOperationBridge;
     @Mock
     private ImageCleanupOperationService imageCleanupOperationService;
 
@@ -47,6 +47,11 @@ class FailedImageCleanupServiceTest {
                 ImageCleanupOperationType.DELETE_OBJECT,
                 "posts/1/a.jpg"
         )).thenReturn(Optional.empty());
+        when(failedImageCleanupRepository.save(any(FailedImageCleanup.class))).thenAnswer(invocation -> {
+            FailedImageCleanup cleanup = invocation.getArgument(0);
+            ReflectionTestUtils.setField(cleanup, "id", 1L);
+            return cleanup;
+        });
 
         failedImageCleanupService.recordDeleteObject("/posts/1/a.jpg", "timeout");
 
@@ -60,10 +65,10 @@ class FailedImageCleanupServiceTest {
         assertThat(saved.getAttemptCount()).isZero();
         assertThat(saved.getLastError()).isEqualTo("timeout");
         assertThat(saved.getNextRetryAt()).isNotNull();
-        verify(imageCleanupRabbitBridge).recordAndPublish(
+        verify(imageCleanupOperationBridge).recordCommonOutbox(
+                1L,
                 ImageCleanupOperationType.DELETE_OBJECT,
-                "posts/1/a.jpg",
-                "timeout"
+                "posts/1/a.jpg"
         );
     }
 
@@ -76,6 +81,7 @@ class FailedImageCleanupServiceTest {
                 "old error"
         );
         existing.markSuccess();
+        ReflectionTestUtils.setField(existing, "id", 2L);
 
         when(failedImageCleanupRepository.findByOperationTypeAndTargetKey(
                 ImageCleanupOperationType.DELETE_OBJECT,
@@ -88,10 +94,10 @@ class FailedImageCleanupServiceTest {
         assertThat(existing.getAttemptCount()).isZero();
         assertThat(existing.getLastError()).isEqualTo("new error");
         verify(failedImageCleanupRepository, never()).save(any());
-        verify(imageCleanupRabbitBridge).recordAndPublish(
+        verify(imageCleanupOperationBridge).recordCommonOutbox(
+                2L,
                 ImageCleanupOperationType.DELETE_OBJECT,
-                "posts/1/a.jpg",
-                "new error"
+                "posts/1/a.jpg"
         );
     }
 
@@ -100,7 +106,7 @@ class FailedImageCleanupServiceTest {
     void recordDeleteObject_ignoresDefaultKey() {
         failedImageCleanupService.recordDeleteObject("default/profile.png", "timeout");
 
-        verifyNoInteractions(failedImageCleanupRepository, imageCleanupRabbitBridge);
+        verifyNoInteractions(failedImageCleanupRepository, imageCleanupOperationBridge);
     }
 
     @Test

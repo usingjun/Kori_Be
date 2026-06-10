@@ -171,6 +171,57 @@ class ImageOperationRecoveryServiceTest {
     }
 
     @Test
+    @DisplayName("FailedImageCleanup DELETE_FOLDER를 공통 CLEANUP_ONLY operation과 Outbox로 예약한다")
+    void scheduleFailedCleanup_createsDeleteFolderOperation() {
+        when(stepRepository.findFirstByStepTypeAndTargetKeyOrderByCreatedAtDesc(
+                ImageOperationStepType.DELETE_FOLDER,
+                "posts/1/"
+        )).thenReturn(Optional.empty());
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID operationId = recoveryService.scheduleFailedCleanup(
+                99L,
+                ImageCleanupOperationType.DELETE_FOLDER,
+                "posts/1/"
+        );
+
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        verify(stepRepository).save(stepCaptor.capture());
+        verify(outboxRepository).save(any());
+        assertThat(operationId).isEqualTo(operationCaptor.getValue().getOperationId());
+        assertThat(operationCaptor.getValue().getOperationType()).isEqualTo(ImageOperationType.CLEANUP_ONLY);
+        assertThat(operationCaptor.getValue().getOwnerType()).isEqualTo(ImageOperationOwnerType.IMAGE);
+        assertThat(operationCaptor.getValue().getOwnerId()).isEqualTo(99L);
+        assertThat(stepCaptor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+    }
+
+    @Test
+    @DisplayName("동일 target의 공통 cleanup step이 진행 중이면 중복 operation을 생성하지 않는다")
+    void scheduleFailedCleanup_reusesActiveStep() {
+        ImageOperationStep activeStep = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "posts/1/a.jpg",
+                5
+        );
+        when(stepRepository.findFirstByStepTypeAndTargetKeyOrderByCreatedAtDesc(
+                ImageOperationStepType.DELETE_OBJECT,
+                "posts/1/a.jpg"
+        )).thenReturn(Optional.of(activeStep));
+
+        UUID operationId = recoveryService.scheduleFailedCleanup(
+                99L,
+                ImageCleanupOperationType.DELETE_OBJECT,
+                "posts/1/a.jpg"
+        );
+
+        assertThat(operationId).isEqualTo(operation.getOperationId());
+        verifyNoInteractions(operationRepository, outboxRepository);
+    }
+
+    @Test
     @DisplayName("마지막 DELETE_OBJECT 완료 시 operation을 COMPLETED 처리한다")
     void markCompleted_marksCleanupOperationCompleted() {
         ImageOperationStep cleanupStep = ImageOperationStep.createDeleteObjectStep(
@@ -217,7 +268,11 @@ class ImageOperationRecoveryServiceTest {
         compensationStep.markProcessing();
         LocalDateTime timedOutBefore = LocalDateTime.now();
         when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
-                List.of(ImageOperationStepType.COMPENSATE_FINAL_OBJECT, ImageOperationStepType.DELETE_OBJECT),
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
                 ImageOperationStepStatus.PROCESSING,
                 timedOutBefore
         )).thenReturn(List.of(compensationStep));
@@ -244,7 +299,11 @@ class ImageOperationRecoveryServiceTest {
         cleanupStep.markProcessing();
         LocalDateTime timedOutBefore = LocalDateTime.now();
         when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
-                List.of(ImageOperationStepType.COMPENSATE_FINAL_OBJECT, ImageOperationStepType.DELETE_OBJECT),
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
                 ImageOperationStepStatus.PROCESSING,
                 timedOutBefore
         )).thenReturn(List.of(cleanupStep));
@@ -261,6 +320,35 @@ class ImageOperationRecoveryServiceTest {
     }
 
     @Test
+    @DisplayName("오래된 PROCESSING DELETE_FOLDER도 RETRY_WAITING으로 복구한다")
+    void recoverTimedOutDeleteSteps_schedulesFolderRetry() {
+        ImageOperationStep folderStep = ImageOperationStep.createDeleteFolderStep(
+                operation.getOperationId(),
+                "posts/1/",
+                5
+        );
+        folderStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(folderStep));
+
+        recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(folderStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(captor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+    }
+
+    @Test
     @DisplayName("timeout 복구 중 재시도 한도를 소진하면 step과 operation을 DLQ 처리한다")
     void recoverTimedOutDeleteSteps_movesExhaustedStepToDlq() {
         ImageOperationStep exhaustedStep = ImageOperationStep.createCompensationStep(
@@ -271,7 +359,11 @@ class ImageOperationRecoveryServiceTest {
         exhaustedStep.markProcessing();
         LocalDateTime timedOutBefore = LocalDateTime.now();
         when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
-                List.of(ImageOperationStepType.COMPENSATE_FINAL_OBJECT, ImageOperationStepType.DELETE_OBJECT),
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
                 ImageOperationStepStatus.PROCESSING,
                 timedOutBefore
         )).thenReturn(List.of(exhaustedStep));

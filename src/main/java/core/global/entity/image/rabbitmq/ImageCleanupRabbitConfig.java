@@ -138,6 +138,13 @@ public class ImageCleanupRabbitConfig {
     }
 
     @Bean
+    public Binding imageOperationDeleteFolderStepBinding() {
+        return BindingBuilder.bind(imageOperationStepQueue())
+                .to(imageOperationExchange())
+                .with(ImageOperationRabbitNames.DELETE_FOLDER_ROUTING_KEY);
+    }
+
+    @Bean
     public Binding imageOperationStepRetryReturnBinding() {
         return BindingBuilder.bind(imageOperationStepQueue())
                 .to(imageOperationExchange())

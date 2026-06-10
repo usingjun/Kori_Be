@@ -83,4 +83,30 @@ class ImageOperationRabbitPublisherTest {
                 any(ImageOperationMessage.class)
         );
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishWithConfirm_routesInitialDeleteFolderStep() {
+        ImageOperationPublishOutbox outbox = ImageOperationPublishOutbox.create(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                ImageOperationStepType.DELETE_FOLDER,
+                "posts/1/",
+                0,
+                ImageOperationMessageDestination.INITIAL
+        );
+        when(rabbitTemplate.invoke(any(RabbitOperations.OperationsCallback.class)))
+                .thenAnswer(invocation -> {
+                    RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+                    return callback.doInRabbit(rabbitOperations);
+                });
+
+        publisher.publishWithConfirm(outbox);
+
+        verify(rabbitOperations).convertAndSend(
+                eq(EXCHANGE),
+                eq(ImageOperationRabbitNames.DELETE_FOLDER_ROUTING_KEY),
+                any(ImageOperationMessage.class)
+        );
+    }
 }

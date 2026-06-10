@@ -125,6 +125,14 @@ public class ImageOperationStep {
         return createDeleteStep(operationId, ImageOperationStepType.DELETE_OBJECT, targetKey, maxAttempts);
     }
 
+    public static ImageOperationStep createDeleteFolderStep(
+            UUID operationId,
+            String targetKey,
+            int maxAttempts
+    ) {
+        return createDeleteStep(operationId, ImageOperationStepType.DELETE_FOLDER, targetKey, maxAttempts);
+    }
+
     private static ImageOperationStep createDeleteStep(
             UUID operationId,
             ImageOperationStepType stepType,

@@ -9,6 +9,7 @@ import core.global.entity.image.repository.ImageOperationRepository;
 import core.global.entity.image.repository.ImageOperationStepRepository;
 import core.global.enums.common.ImageOperationMessageDestination;
 import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageCleanupOperationType;
 import core.global.enums.common.ImageOperationStepStatus;
 import core.global.enums.common.ImageOperationStepType;
 import core.global.enums.common.ImageOperationType;
@@ -19,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -30,7 +32,8 @@ public class ImageOperationRecoveryService {
     private static final int DEFAULT_CLEANUP_MAX_ATTEMPTS = 5;
     private static final List<ImageOperationStepType> RECOVERABLE_DELETE_STEP_TYPES = List.of(
             ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
-            ImageOperationStepType.DELETE_OBJECT
+            ImageOperationStepType.DELETE_OBJECT,
+            ImageOperationStepType.DELETE_FOLDER
     );
 
     private final ImageOperationRepository operationRepository;
@@ -106,6 +109,40 @@ public class ImageOperationRecoveryService {
             );
             outboxRepository.save(outbox(step, 0, ImageOperationMessageDestination.INITIAL));
         }
+        return operation.getOperationId();
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public UUID scheduleFailedCleanup(
+            Long failedCleanupId,
+            ImageCleanupOperationType operationType,
+            String targetKey
+    ) {
+        ImageOperationStepType stepType = cleanupStepType(operationType);
+        Optional<ImageOperationStep> latestStep =
+                stepRepository.findFirstByStepTypeAndTargetKeyOrderByCreatedAtDesc(stepType, targetKey);
+        if (latestStep.isPresent() && isActive(latestStep.get().getStatus())) {
+            return latestStep.get().getOperationId();
+        }
+
+        ImageOperation operation = operationRepository.save(
+                ImageOperation.create(
+                        ImageOperationType.CLEANUP_ONLY,
+                        ImageOperationOwnerType.IMAGE,
+                        failedCleanupId
+                )
+        );
+        operation.markProcessing();
+        ImageOperationStep step = stepRepository.save(
+                operationType == ImageCleanupOperationType.DELETE_OBJECT
+                        ? ImageOperationStep.createDeleteObjectStep(
+                                operation.getOperationId(), targetKey, DEFAULT_CLEANUP_MAX_ATTEMPTS
+                        )
+                        : ImageOperationStep.createDeleteFolderStep(
+                                operation.getOperationId(), targetKey, DEFAULT_CLEANUP_MAX_ATTEMPTS
+                        )
+        );
+        outboxRepository.save(outbox(step, 0, ImageOperationMessageDestination.INITIAL));
         return operation.getOperationId();
     }
 
@@ -203,6 +240,19 @@ public class ImageOperationRecoveryService {
             throw new IllegalArgumentException("Image operation message does not match persisted step");
         }
         return step;
+    }
+
+    private ImageOperationStepType cleanupStepType(ImageCleanupOperationType operationType) {
+        return switch (operationType) {
+            case DELETE_OBJECT -> ImageOperationStepType.DELETE_OBJECT;
+            case DELETE_FOLDER -> ImageOperationStepType.DELETE_FOLDER;
+        };
+    }
+
+    private boolean isActive(ImageOperationStepStatus status) {
+        return status == ImageOperationStepStatus.PENDING
+                || status == ImageOperationStepStatus.PROCESSING
+                || status == ImageOperationStepStatus.RETRY_WAITING;
     }
 
     private ImageOperationPublishOutbox outbox(

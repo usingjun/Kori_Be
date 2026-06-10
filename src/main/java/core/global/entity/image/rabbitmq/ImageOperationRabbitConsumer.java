@@ -1,6 +1,7 @@
 package core.global.entity.image.rabbitmq;
 
 import core.global.entity.image.service.ImageObjectDeleteExecutor;
+import core.global.entity.image.service.FailedImageCleanupService;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.enums.common.ImageOperationStepType;
 import lombok.RequiredArgsConstructor;
@@ -17,6 +18,7 @@ public class ImageOperationRabbitConsumer {
 
     private final ImageOperationRecoveryService recoveryService;
     private final ImageObjectDeleteExecutor objectDeleteExecutor;
+    private final FailedImageCleanupService failedImageCleanupService;
 
     @RabbitListener(queues = ImageOperationRabbitNames.STEP_QUEUE)
     public void consume(ImageOperationMessage message) {
@@ -28,6 +30,10 @@ public class ImageOperationRabbitConsumer {
         try {
             switch (message.stepType()) {
                 case COMPENSATE_FINAL_OBJECT, DELETE_OBJECT -> objectDeleteExecutor.deleteObject(message.targetKey());
+                case DELETE_FOLDER -> failedImageCleanupService.executeCleanup(
+                        core.global.enums.common.ImageCleanupOperationType.DELETE_FOLDER,
+                        message.targetKey()
+                );
                 default -> throw new IllegalArgumentException(
                         "Unsupported image operation step type " + message.stepType()
                 );
