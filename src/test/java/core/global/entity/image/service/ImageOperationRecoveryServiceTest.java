@@ -97,7 +97,7 @@ class ImageOperationRecoveryServiceTest {
         assertThat(compensationStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
         assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.RETRY);
         verify(consumedMessageRepository).insertIfAbsent(
-                message.messageId(), message.operationId(), message.stepId(), "image-operation-compensation-consumer"
+                message.messageId(), message.operationId(), message.stepId(), "image-operation-step-consumer"
         );
     }
 
@@ -109,6 +109,88 @@ class ImageOperationRecoveryServiceTest {
 
         assertThat(recoveryService.begin(message)).isFalse();
         verifyNoInteractions(stepRepository);
+    }
+
+    @Test
+    @DisplayName("기존 operation에 DELETE_OBJECT step과 초기 Outbox를 생성한다")
+    void scheduleDeleteObjects_addsCleanupStepsToExistingOperation() {
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+        when(stepRepository.findByOperationIdAndStepTypeAndTargetKey(
+                eq(operation.getOperationId()),
+                eq(ImageOperationStepType.DELETE_OBJECT),
+                anyString()
+        )).thenReturn(Optional.empty());
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID result = recoveryService.scheduleDeleteObjects(
+                operation.getOperationId(),
+                ImageOperationOwnerType.USER,
+                10L,
+                List.of("users/10/old.jpg", "temp/profile.jpg", "temp/profile.jpg")
+        );
+
+        assertThat(result).isEqualTo(operation.getOperationId());
+        verify(stepRepository, times(2)).save(any());
+        verify(outboxRepository, times(2)).save(any());
+    }
+
+    @Test
+    @DisplayName("기존 operation이 없으면 CLEANUP_ONLY operation을 생성한다")
+    void scheduleDeleteObjects_createsCleanupOnlyOperation() {
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.findByOperationIdAndStepTypeAndTargetKey(any(), any(), anyString()))
+                .thenReturn(Optional.empty());
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID operationId = recoveryService.scheduleDeleteObjects(
+                null,
+                ImageOperationOwnerType.USER,
+                10L,
+                List.of("users/10/old.jpg")
+        );
+
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        assertThat(operationId).isEqualTo(operationCaptor.getValue().getOperationId());
+        assertThat(operationCaptor.getValue().getOperationType()).isEqualTo(ImageOperationType.CLEANUP_ONLY);
+        assertThat(operationCaptor.getValue().getStatus()).isEqualTo(ImageOperationStatus.PROCESSING);
+    }
+
+    @Test
+    @DisplayName("삭제 대상이 없으면 cleanup operation을 생성하지 않는다")
+    void scheduleDeleteObjects_skipsEmptyTargets() {
+        UUID result = recoveryService.scheduleDeleteObjects(
+                null,
+                ImageOperationOwnerType.USER,
+                10L,
+                List.of()
+        );
+
+        assertThat(result).isNull();
+        verifyNoInteractions(operationRepository, stepRepository, outboxRepository);
+    }
+
+    @Test
+    @DisplayName("마지막 DELETE_OBJECT 완료 시 operation을 COMPLETED 처리한다")
+    void markCompleted_marksCleanupOperationCompleted() {
+        ImageOperationStep cleanupStep = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "users/10/old.jpg",
+                5
+        );
+        cleanupStep.markProcessing();
+        ImageOperationRecoveryService.ImageOperationMessageView message = messageView(cleanupStep, 0);
+        when(stepRepository.findById(cleanupStep.getStepId())).thenReturn(Optional.of(cleanupStep));
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+        when(stepRepository.existsByOperationIdAndStatusNot(
+                operation.getOperationId(),
+                ImageOperationStepStatus.COMPLETED
+        )).thenReturn(false);
+
+        recoveryService.markCompleted(message);
+
+        assertThat(cleanupStep.getStatus()).isEqualTo(ImageOperationStepStatus.COMPLETED);
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.COMPLETED);
     }
 
     @Test
@@ -125,7 +207,7 @@ class ImageOperationRecoveryServiceTest {
         assertThat(compensationStep.getStatus()).isEqualTo(ImageOperationStepStatus.COMPLETED);
         assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.COMPENSATED);
         verify(consumedMessageRepository).insertIfAbsent(
-                message.messageId(), message.operationId(), message.stepId(), "image-operation-compensation-consumer"
+                message.messageId(), message.operationId(), message.stepId(), "image-operation-step-consumer"
         );
     }
 

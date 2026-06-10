@@ -14,6 +14,8 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import java.util.UUID;
 
 import static core.global.entity.image.rabbitmq.ImageCleanupRabbitNames.RETRY_EXCHANGE;
+import static core.global.entity.image.rabbitmq.ImageCleanupRabbitNames.EXCHANGE;
+import static core.global.entity.image.rabbitmq.ImageOperationRabbitNames.DELETE_OBJECT_ROUTING_KEY;
 import static core.global.entity.image.rabbitmq.ImageOperationRabbitNames.STEP_RETRY_PREFIX;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
@@ -54,5 +56,31 @@ class ImageOperationRabbitPublisherTest {
                 any(ImageOperationMessage.class)
         );
         verify(rabbitOperations).waitForConfirmsOrDie(5000);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishWithConfirm_routesInitialDeleteObjectStep() {
+        ImageOperationPublishOutbox outbox = ImageOperationPublishOutbox.create(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                ImageOperationStepType.DELETE_OBJECT,
+                "users/10/old.jpg",
+                0,
+                ImageOperationMessageDestination.INITIAL
+        );
+        when(rabbitTemplate.invoke(any(RabbitOperations.OperationsCallback.class)))
+                .thenAnswer(invocation -> {
+                    RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+                    return callback.doInRabbit(rabbitOperations);
+                });
+
+        publisher.publishWithConfirm(outbox);
+
+        verify(rabbitOperations).convertAndSend(
+                eq(EXCHANGE),
+                eq(DELETE_OBJECT_ROUTING_KEY),
+                any(ImageOperationMessage.class)
+        );
     }
 }

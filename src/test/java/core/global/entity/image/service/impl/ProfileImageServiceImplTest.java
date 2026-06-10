@@ -71,6 +71,7 @@ class ProfileImageServiceImplTest {
         ReflectionTestUtils.setField(profileImageService, "bucket", "test-bucket");
         ReflectionTestUtils.setField(profileImageService, "endPoint", "https://object.example.com");
         ReflectionTestUtils.setField(profileImageService, "cdnBaseUrl", CDN_BASE_URL);
+        ReflectionTestUtils.setField(profileImageService, "imageOperationRabbitEnabled", true);
 
         operationId = UUID.randomUUID();
         stepId = UUID.randomUUID();
@@ -85,8 +86,8 @@ class ProfileImageServiceImplTest {
     }
 
     @Test
-    @DisplayName("프로필 staging Copy와 DB 반영 성공 후 기존 object와 staging을 cleanup한다")
-    void updateUserProfileImage_updatesBeforeCleanup() {
+    @DisplayName("프로필 staging Copy와 DB 반영 성공 시 기존 object와 staging cleanup을 예약한다")
+    void updateUserProfileImage_schedulesCleanupInTransaction() {
         prepareStagingUpdate();
         TransactionSynchronizationManager.initSynchronization();
         try {
@@ -96,15 +97,13 @@ class ProfileImageServiceImplTest {
             assertThat(existingImage.getUrl()).isEqualTo(result);
             verify(imageRepository).flush();
             verify(storageClient, never()).deleteObjectsBulk(anyList());
-
-            TransactionSynchronizationManager.getSynchronizations()
-                    .forEach(TransactionSynchronization::afterCommit);
-
-            verify(storageClient).deleteObjectsBulk(List.of(OLD_KEY, SOURCE_KEY));
-            verify(imageOperationService).markCompleted(operationId);
-            InOrder order = inOrder(imageRepository, storageClient);
-            order.verify(imageRepository).flush();
-            order.verify(storageClient).deleteObjectsBulk(List.of(OLD_KEY, SOURCE_KEY));
+            verify(imageOperationRecoveryService).scheduleDeleteObjects(
+                    operationId,
+                    ImageOperationOwnerType.USER,
+                    USER_ID,
+                    List.of(OLD_KEY, SOURCE_KEY)
+            );
+            verify(imageOperationService, never()).markCompleted(operationId);
         } finally {
             TransactionSynchronizationManager.clearSynchronization();
         }
@@ -125,6 +124,28 @@ class ProfileImageServiceImplTest {
         verify(imageOperationService).markFailed(operationId);
         verify(imageRepository, never()).flush();
         verify(storageClient, never()).deleteObjectsBulk(anyList());
+    }
+
+    @Test
+    @DisplayName("RabbitMQ 비활성화 시 기존 afterCommit cleanup을 fallback으로 유지한다")
+    void updateUserProfileImage_usesDirectCleanupFallbackWhenRabbitDisabled() {
+        prepareStagingUpdate();
+        ReflectionTestUtils.setField(profileImageService, "imageOperationRabbitEnabled", false);
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            profileImageService.updateUserProfileImage(USER_ID, SOURCE_KEY);
+
+            verify(imageOperationRecoveryService, never()).scheduleDeleteObjects(any(), any(), any(), anyList());
+            verify(storageClient, never()).deleteObjectsBulk(anyList());
+
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(TransactionSynchronization::afterCommit);
+
+            verify(storageClient).deleteObjectsBulk(List.of(OLD_KEY, SOURCE_KEY));
+            verify(imageOperationService).markCompleted(operationId);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
     }
 
     @Test
@@ -155,6 +176,12 @@ class ProfileImageServiceImplTest {
                             synchronization.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK));
 
             verify(imageOperationRecoveryService).scheduleCompensation(operationId, TARGET_KEY);
+            verify(imageOperationRecoveryService).scheduleDeleteObjects(
+                    operationId,
+                    ImageOperationOwnerType.USER,
+                    USER_ID,
+                    List.of(OLD_KEY, SOURCE_KEY)
+            );
             verify(imageOperationService, never()).markCompleted(operationId);
         } finally {
             TransactionSynchronizationManager.clearSynchronization();

@@ -114,12 +114,29 @@ public class ImageOperationStep {
             String targetKey,
             int maxAttempts
     ) {
+        return createDeleteStep(operationId, ImageOperationStepType.COMPENSATE_FINAL_OBJECT, targetKey, maxAttempts);
+    }
+
+    public static ImageOperationStep createDeleteObjectStep(
+            UUID operationId,
+            String targetKey,
+            int maxAttempts
+    ) {
+        return createDeleteStep(operationId, ImageOperationStepType.DELETE_OBJECT, targetKey, maxAttempts);
+    }
+
+    private static ImageOperationStep createDeleteStep(
+            UUID operationId,
+            ImageOperationStepType stepType,
+            String targetKey,
+            int maxAttempts
+    ) {
         requirePositiveAttempts(maxAttempts);
         LocalDateTime now = LocalDateTime.now();
         ImageOperationStep step = new ImageOperationStep();
         step.stepId = UUID.randomUUID();
         step.operationId = Objects.requireNonNull(operationId);
-        step.stepType = ImageOperationStepType.COMPENSATE_FINAL_OBJECT;
+        step.stepType = stepType;
         step.status = ImageOperationStepStatus.PENDING;
         step.targetKey = requireText(targetKey, "targetKey");
         step.attemptCount = 0;

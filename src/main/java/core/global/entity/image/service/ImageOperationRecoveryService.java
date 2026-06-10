@@ -8,8 +8,10 @@ import core.global.entity.image.repository.ImageOperationPublishOutboxRepository
 import core.global.entity.image.repository.ImageOperationRepository;
 import core.global.entity.image.repository.ImageOperationStepRepository;
 import core.global.enums.common.ImageOperationMessageDestination;
+import core.global.enums.common.ImageOperationOwnerType;
 import core.global.enums.common.ImageOperationStepStatus;
 import core.global.enums.common.ImageOperationStepType;
+import core.global.enums.common.ImageOperationType;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -23,8 +25,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ImageOperationRecoveryService {
 
-    private static final String CONSUMER_NAME = "image-operation-compensation-consumer";
+    private static final String CONSUMER_NAME = "image-operation-step-consumer";
     private static final int DEFAULT_COMPENSATION_MAX_ATTEMPTS = 5;
+    private static final int DEFAULT_CLEANUP_MAX_ATTEMPTS = 5;
 
     private final ImageOperationRepository operationRepository;
     private final ImageOperationStepRepository stepRepository;
@@ -53,6 +56,55 @@ public class ImageOperationRecoveryService {
         operation.markFailed();
     }
 
+    @Transactional
+    public UUID scheduleDeleteObjects(
+            UUID existingOperationId,
+            ImageOperationOwnerType ownerType,
+            Long ownerId,
+            List<String> targetKeys
+    ) {
+        List<String> cleanupKeys = targetKeys.stream()
+                .filter(key -> key != null && !key.isBlank())
+                .distinct()
+                .toList();
+        if (cleanupKeys.isEmpty()) {
+            return existingOperationId;
+        }
+
+        ImageOperation operation;
+        if (existingOperationId == null) {
+            operation = operationRepository.save(
+                    ImageOperation.create(
+                            ImageOperationType.CLEANUP_ONLY,
+                            ownerType,
+                            ownerId
+                    )
+            );
+            operation.markProcessing();
+        } else {
+            operation = operationRepository.findById(existingOperationId).orElseThrow();
+        }
+
+        for (String targetKey : cleanupKeys) {
+            if (stepRepository.findByOperationIdAndStepTypeAndTargetKey(
+                    operation.getOperationId(),
+                    ImageOperationStepType.DELETE_OBJECT,
+                    targetKey
+            ).isPresent()) {
+                continue;
+            }
+            ImageOperationStep step = stepRepository.save(
+                    ImageOperationStep.createDeleteObjectStep(
+                            operation.getOperationId(),
+                            targetKey,
+                            DEFAULT_CLEANUP_MAX_ATTEMPTS
+                    )
+            );
+            outboxRepository.save(outbox(step, 0, ImageOperationMessageDestination.INITIAL));
+        }
+        return operation.getOperationId();
+    }
+
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean begin(ImageOperationMessageView message) {
         if (consumedMessageRepository.existsById(message.messageId())) {
@@ -76,7 +128,15 @@ public class ImageOperationRecoveryService {
         }
         ImageOperationStep step = findMatchingStep(message);
         step.markCompletedWithoutResult();
-        operationRepository.findById(message.operationId()).orElseThrow().markCompensated();
+        ImageOperation operation = operationRepository.findById(message.operationId()).orElseThrow();
+        if (step.getStepType() == ImageOperationStepType.COMPENSATE_FINAL_OBJECT) {
+            operation.markCompensated();
+        } else if (!stepRepository.existsByOperationIdAndStatusNot(
+                message.operationId(),
+                ImageOperationStepStatus.COMPLETED
+        )) {
+            operation.markCompleted();
+        }
         consumedMessageRepository.insertIfAbsent(
                 message.messageId(),
                 message.operationId(),

@@ -1,6 +1,6 @@
 package core.global.entity.image.rabbitmq;
 
-import core.global.entity.image.service.ImageCompensationExecutor;
+import core.global.entity.image.service.ImageObjectDeleteExecutor;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.enums.common.ImageOperationStepType;
 import org.junit.jupiter.api.Test;
@@ -21,7 +21,7 @@ class ImageOperationRabbitConsumerTest {
     @Mock
     private ImageOperationRecoveryService recoveryService;
     @Mock
-    private ImageCompensationExecutor compensationExecutor;
+    private ImageObjectDeleteExecutor objectDeleteExecutor;
 
     @InjectMocks
     private ImageOperationRabbitConsumer consumer;
@@ -33,9 +33,20 @@ class ImageOperationRabbitConsumerTest {
 
         consumer.consume(message);
 
-        verify(compensationExecutor).deleteFinalObject(message.targetKey());
+        verify(objectDeleteExecutor).deleteObject(message.targetKey());
         verify(recoveryService).markCompleted(any());
         verify(recoveryService, never()).markFailedAndSchedule(any(), any());
+    }
+
+    @Test
+    void consume_deletesCleanupObjectAndCompletesStep() {
+        ImageOperationMessage message = message(ImageOperationStepType.DELETE_OBJECT);
+        when(recoveryService.begin(any())).thenReturn(true);
+
+        consumer.consume(message);
+
+        verify(objectDeleteExecutor).deleteObject(message.targetKey());
+        verify(recoveryService).markCompleted(any());
     }
 
     @Test
@@ -43,7 +54,7 @@ class ImageOperationRabbitConsumerTest {
         ImageOperationMessage message = message();
         when(recoveryService.begin(any())).thenReturn(true);
         doThrow(new IllegalStateException("delete failed"))
-                .when(compensationExecutor).deleteFinalObject(message.targetKey());
+                .when(objectDeleteExecutor).deleteObject(message.targetKey());
         when(recoveryService.markFailedAndSchedule(any(), eq("delete failed")))
                 .thenReturn(new ImageOperationRecoveryService.FailureDecision(false, 1));
 
@@ -60,16 +71,20 @@ class ImageOperationRabbitConsumerTest {
 
         consumer.consume(message);
 
-        verifyNoInteractions(compensationExecutor);
+        verifyNoInteractions(objectDeleteExecutor);
         verify(recoveryService, never()).markCompleted(any());
     }
 
     private ImageOperationMessage message() {
+        return message(ImageOperationStepType.COMPENSATE_FINAL_OBJECT);
+    }
+
+    private ImageOperationMessage message(ImageOperationStepType stepType) {
         return new ImageOperationMessage(
                 UUID.randomUUID(),
                 UUID.randomUUID(),
                 UUID.randomUUID(),
-                ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                stepType,
                 "users/10/profile.jpg",
                 0,
                 1,

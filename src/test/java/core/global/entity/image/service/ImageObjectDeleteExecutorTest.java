@@ -14,7 +14,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
-class ImageCompensationExecutorTest {
+class ImageObjectDeleteExecutorTest {
 
     @Mock
     private S3Client s3Client;
@@ -22,7 +22,7 @@ class ImageCompensationExecutorTest {
     private ImageStorageClient storageClient;
 
     @InjectMocks
-    private ImageCompensationExecutor executor;
+    private ImageObjectDeleteExecutor executor;
 
     @BeforeEach
     void setUp() {
@@ -30,7 +30,7 @@ class ImageCompensationExecutorTest {
     }
 
     @Test
-    void deleteFinalObject_deletesNonDefaultObject() {
+    void deleteObject_deletesNonDefaultObject() {
         DeleteObjectResponse response = mock(DeleteObjectResponse.class);
         when(storageClient.isDefaultUrlOrKey("users/10/profile.jpg")).thenReturn(false);
         when(s3Client.deleteObject(any(java.util.function.Consumer.class))).thenReturn(response);
@@ -38,16 +38,16 @@ class ImageCompensationExecutorTest {
                 software.amazon.awssdk.http.SdkHttpResponse.builder().statusCode(204).build()
         );
 
-        executor.deleteFinalObject("users/10/profile.jpg");
+        executor.deleteObject("users/10/profile.jpg");
 
         verify(s3Client).deleteObject(any(java.util.function.Consumer.class));
     }
 
     @Test
-    void deleteFinalObject_skipsDefaultObject() {
+    void deleteObject_skipsDefaultObject() {
         when(storageClient.isDefaultUrlOrKey("default/profile.jpg")).thenReturn(true);
 
-        executor.deleteFinalObject("default/profile.jpg");
+        executor.deleteObject("default/profile.jpg");
 
         verifyNoInteractions(s3Client);
     }

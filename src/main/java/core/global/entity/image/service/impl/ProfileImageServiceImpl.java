@@ -65,6 +65,8 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     private String endPoint;
     @Value("${cdn.base-url}")
     private String cdnBaseUrl;
+    @Value("${image.cleanup.rabbit.enabled:false}")
+    private boolean imageOperationRabbitEnabled;
 
     /**
      * 초기 셋업 시 유저 프로필 설정
@@ -171,7 +173,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             throw e;
         }
 
-        scheduleCleanupAfterCommit(oldKey, requestInfo, finalKey, copyPlan);
+        scheduleCleanupAndRollbackCompensation(userId, oldKey, requestInfo, finalKey, copyPlan);
         log.info("[프로필 수정 종료] 성공적으로 변경되었습니다. finalUrl: {}", resultUrl);
 
         return resultUrl;
@@ -447,7 +449,8 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         }
     }
 
-    private void scheduleCleanupAfterCommit(
+    private void scheduleCleanupAndRollbackCompensation(
+            Long userId,
             String previousKey,
             RequestInfo requestInfo,
             String finalKey,
@@ -455,18 +458,45 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     ) {
         String oldKey = java.util.Objects.equals(previousKey, finalKey) ? null : previousKey;
         String stagingKey = requestInfo.isStaging() ? requestInfo.getReqKey() : null;
+        List<String> cleanupKeys = java.util.stream.Stream.of(oldKey, stagingKey)
+                .filter(java.util.Objects::nonNull)
+                .filter(key -> !storageClient.isDefaultUrlOrKey(key))
+                .distinct()
+                .toList();
 
+        if (TransactionSynchronizationManager.isSynchronizationActive() && copyPlan != null) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                        createCompensation(copyPlan, finalKey);
+                    }
+                }
+            });
+        }
+
+        if (!imageOperationRabbitEnabled) {
+            scheduleDirectCleanupFallback(cleanupKeys, copyPlan);
+            return;
+        }
+
+        imageOperationRecoveryService.scheduleDeleteObjects(
+                copyPlan == null ? null : copyPlan.operationId(),
+                ImageOperationOwnerType.USER,
+                userId,
+                cleanupKeys
+        );
+    }
+
+    private void scheduleDirectCleanupFallback(
+            List<String> cleanupKeys,
+            ImageOperationService.CopyOperationPlan copyPlan
+    ) {
         Runnable cleanup = () -> {
             try {
-                storageClient.deleteObjectsBulk(
-                        java.util.stream.Stream.of(oldKey, stagingKey)
-                                .filter(java.util.Objects::nonNull)
-                                .distinct()
-                                .toList()
-                );
+                storageClient.deleteObjectsBulk(cleanupKeys);
             } catch (RuntimeException e) {
-                log.error("[UPI] post-commit cleanup invocation failed oldKey={} stagingKey={}",
-                        oldKey, stagingKey, e);
+                log.error("[UPI] direct cleanup fallback failed keys={}", cleanupKeys, e);
             }
             if (copyPlan != null) {
                 try {
@@ -486,13 +516,6 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             @Override
             public void afterCommit() {
                 cleanup.run();
-            }
-
-            @Override
-            public void afterCompletion(int status) {
-                if (status != TransactionSynchronization.STATUS_COMMITTED && copyPlan != null) {
-                    createCompensation(copyPlan, finalKey);
-                }
             }
         });
     }

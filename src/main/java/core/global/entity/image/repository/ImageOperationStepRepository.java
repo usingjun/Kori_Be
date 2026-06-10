@@ -23,4 +23,6 @@ public interface ImageOperationStepRepository extends JpaRepository<ImageOperati
             ImageOperationStepStatus status,
             LocalDateTime updatedAt
     );
+
+    boolean existsByOperationIdAndStatusNot(UUID operationId, ImageOperationStepStatus status);
 }

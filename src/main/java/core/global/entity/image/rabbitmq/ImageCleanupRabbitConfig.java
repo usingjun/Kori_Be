@@ -131,6 +131,13 @@ public class ImageCleanupRabbitConfig {
     }
 
     @Bean
+    public Binding imageOperationDeleteObjectStepBinding() {
+        return BindingBuilder.bind(imageOperationStepQueue())
+                .to(imageOperationExchange())
+                .with(ImageOperationRabbitNames.DELETE_OBJECT_ROUTING_KEY);
+    }
+
+    @Bean
     public Binding imageOperationStepRetryReturnBinding() {
         return BindingBuilder.bind(imageOperationStepQueue())
                 .to(imageOperationExchange())

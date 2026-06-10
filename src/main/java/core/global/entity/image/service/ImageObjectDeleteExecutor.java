@@ -8,7 +8,7 @@ import software.amazon.awssdk.services.s3.model.DeleteObjectResponse;
 
 @Component
 @RequiredArgsConstructor
-public class ImageCompensationExecutor {
+public class ImageObjectDeleteExecutor {
 
     private final S3Client s3Client;
     private final ImageStorageClient storageClient;
@@ -16,7 +16,7 @@ public class ImageCompensationExecutor {
     @Value("${ncp.s3.bucket}")
     private String bucket;
 
-    public void deleteFinalObject(String targetKey) {
+    public void deleteObject(String targetKey) {
         if (storageClient.isDefaultUrlOrKey(targetKey)) {
             return;
         }

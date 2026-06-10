@@ -1,6 +1,6 @@
 package core.global.entity.image.rabbitmq;
 
-import core.global.entity.image.service.ImageCompensationExecutor;
+import core.global.entity.image.service.ImageObjectDeleteExecutor;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.enums.common.ImageOperationStepType;
 import lombok.RequiredArgsConstructor;
@@ -16,7 +16,7 @@ import org.springframework.stereotype.Component;
 public class ImageOperationRabbitConsumer {
 
     private final ImageOperationRecoveryService recoveryService;
-    private final ImageCompensationExecutor compensationExecutor;
+    private final ImageObjectDeleteExecutor objectDeleteExecutor;
 
     @RabbitListener(queues = ImageOperationRabbitNames.STEP_QUEUE)
     public void consume(ImageOperationMessage message) {
@@ -26,16 +26,19 @@ public class ImageOperationRabbitConsumer {
         }
 
         try {
-            if (message.stepType() != ImageOperationStepType.COMPENSATE_FINAL_OBJECT) {
-                throw new IllegalArgumentException("Unsupported image operation step type " + message.stepType());
+            switch (message.stepType()) {
+                case COMPENSATE_FINAL_OBJECT, DELETE_OBJECT -> objectDeleteExecutor.deleteObject(message.targetKey());
+                default -> throw new IllegalArgumentException(
+                        "Unsupported image operation step type " + message.stepType()
+                );
             }
-            compensationExecutor.deleteFinalObject(message.targetKey());
             recoveryService.markCompleted(view);
         } catch (Exception e) {
             ImageOperationRecoveryService.FailureDecision decision =
                     recoveryService.markFailedAndSchedule(view, e.getMessage());
-            log.warn("[ImageOperationConsumer] compensation failed operationId={} stepId={} attempt={} exhausted={}",
-                    message.operationId(), message.stepId(), decision.attempt(), decision.exhausted(), e);
+            log.warn("[ImageOperationConsumer] step failed operationId={} stepId={} type={} attempt={} exhausted={}",
+                    message.operationId(), message.stepId(), message.stepType(),
+                    decision.attempt(), decision.exhausted(), e);
         }
     }
 
