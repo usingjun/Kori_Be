@@ -22,12 +22,12 @@ public class ImageOperationTimeoutRecoveryScheduler {
     private Duration processingTimeout;
 
     @Scheduled(fixedDelayString = "${image.operation.timeout-recovery-delay-ms:60000}")
-    public void recoverTimedOutCompensations() {
-        int recovered = recoveryService.recoverTimedOutCompensations(
+    public void recoverTimedOutDeleteSteps() {
+        int recovered = recoveryService.recoverTimedOutDeleteSteps(
                 LocalDateTime.now().minus(processingTimeout)
         );
         if (recovered > 0) {
-            log.warn("[ImageOperationRecovery] recovered timed-out compensation steps count={}", recovered);
+            log.warn("[ImageOperationRecovery] recovered timed-out delete steps count={}", recovered);
         }
     }
 }

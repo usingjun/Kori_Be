@@ -28,6 +28,10 @@ public class ImageOperationRecoveryService {
     private static final String CONSUMER_NAME = "image-operation-step-consumer";
     private static final int DEFAULT_COMPENSATION_MAX_ATTEMPTS = 5;
     private static final int DEFAULT_CLEANUP_MAX_ATTEMPTS = 5;
+    private static final List<ImageOperationStepType> RECOVERABLE_DELETE_STEP_TYPES = List.of(
+            ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+            ImageOperationStepType.DELETE_OBJECT
+    );
 
     private final ImageOperationRepository operationRepository;
     private final ImageOperationStepRepository stepRepository;
@@ -170,16 +174,16 @@ public class ImageOperationRecoveryService {
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public int recoverTimedOutCompensations(LocalDateTime timedOutBefore) {
+    public int recoverTimedOutDeleteSteps(LocalDateTime timedOutBefore) {
         List<ImageOperationStep> timedOutSteps =
-                stepRepository.findTop50ByStepTypeAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
-                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                        RECOVERABLE_DELETE_STEP_TYPES,
                         ImageOperationStepStatus.PROCESSING,
                         timedOutBefore
                 );
 
         for (ImageOperationStep step : timedOutSteps) {
-            boolean exhausted = step.markFailed("Compensation processing timeout");
+            boolean exhausted = step.markFailed("Image object delete processing timeout");
             ImageOperationMessageDestination destination = exhausted
                     ? ImageOperationMessageDestination.DLQ
                     : ImageOperationMessageDestination.RETRY;

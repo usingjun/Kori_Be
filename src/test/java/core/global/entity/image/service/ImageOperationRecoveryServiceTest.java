@@ -212,17 +212,17 @@ class ImageOperationRecoveryServiceTest {
     }
 
     @Test
-    @DisplayName("오래된 PROCESSING 보상 step을 RETRY_WAITING으로 복구하고 retry Outbox를 생성한다")
-    void recoverTimedOutCompensations_schedulesRetry() {
+    @DisplayName("오래된 PROCESSING 보상 삭제 step을 RETRY_WAITING으로 복구하고 retry Outbox를 생성한다")
+    void recoverTimedOutDeleteSteps_schedulesCompensationRetry() {
         compensationStep.markProcessing();
         LocalDateTime timedOutBefore = LocalDateTime.now();
-        when(stepRepository.findTop50ByStepTypeAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
-                ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(ImageOperationStepType.COMPENSATE_FINAL_OBJECT, ImageOperationStepType.DELETE_OBJECT),
                 ImageOperationStepStatus.PROCESSING,
                 timedOutBefore
         )).thenReturn(List.of(compensationStep));
 
-        int recovered = recoveryService.recoverTimedOutCompensations(timedOutBefore);
+        int recovered = recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
 
         ArgumentCaptor<ImageOperationPublishOutbox> captor =
                 ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
@@ -234,8 +234,35 @@ class ImageOperationRecoveryServiceTest {
     }
 
     @Test
+    @DisplayName("오래된 PROCESSING 정상 cleanup DELETE_OBJECT도 RETRY_WAITING으로 복구한다")
+    void recoverTimedOutDeleteSteps_schedulesCleanupRetry() {
+        ImageOperationStep cleanupStep = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "users/10/old.jpg",
+                5
+        );
+        cleanupStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(ImageOperationStepType.COMPENSATE_FINAL_OBJECT, ImageOperationStepType.DELETE_OBJECT),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(cleanupStep));
+
+        int recovered = recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(recovered).isEqualTo(1);
+        assertThat(cleanupStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(captor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_OBJECT);
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.RETRY);
+    }
+
+    @Test
     @DisplayName("timeout 복구 중 재시도 한도를 소진하면 step과 operation을 DLQ 처리한다")
-    void recoverTimedOutCompensations_movesExhaustedStepToDlq() {
+    void recoverTimedOutDeleteSteps_movesExhaustedStepToDlq() {
         ImageOperationStep exhaustedStep = ImageOperationStep.createCompensationStep(
                 operation.getOperationId(),
                 "users/10/exhausted.jpg",
@@ -243,14 +270,14 @@ class ImageOperationRecoveryServiceTest {
         );
         exhaustedStep.markProcessing();
         LocalDateTime timedOutBefore = LocalDateTime.now();
-        when(stepRepository.findTop50ByStepTypeAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
-                ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(ImageOperationStepType.COMPENSATE_FINAL_OBJECT, ImageOperationStepType.DELETE_OBJECT),
                 ImageOperationStepStatus.PROCESSING,
                 timedOutBefore
         )).thenReturn(List.of(exhaustedStep));
         when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
 
-        recoveryService.recoverTimedOutCompensations(timedOutBefore);
+        recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
 
         ArgumentCaptor<ImageOperationPublishOutbox> captor =
                 ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);

@@ -23,13 +23,13 @@ class ImageOperationTimeoutRecoverySchedulerTest {
     private ImageOperationTimeoutRecoveryScheduler scheduler;
 
     @Test
-    void recoverTimedOutCompensations_usesConfiguredTimeout() {
+    void recoverTimedOutDeleteSteps_usesConfiguredTimeout() {
         ReflectionTestUtils.setField(scheduler, "processingTimeout", Duration.ofMinutes(5));
         LocalDateTime expected = LocalDateTime.now().minusMinutes(5);
 
-        scheduler.recoverTimedOutCompensations();
+        scheduler.recoverTimedOutDeleteSteps();
 
-        verify(recoveryService).recoverTimedOutCompensations(argThat(actual ->
+        verify(recoveryService).recoverTimedOutDeleteSteps(argThat(actual ->
                 !actual.isBefore(expected.minusSeconds(1))
                         && !actual.isAfter(expected.plusSeconds(1))
         ));

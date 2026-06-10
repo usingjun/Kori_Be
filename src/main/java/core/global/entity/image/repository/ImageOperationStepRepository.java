@@ -18,8 +18,8 @@ public interface ImageOperationStepRepository extends JpaRepository<ImageOperati
             String targetKey
     );
 
-    List<ImageOperationStep> findTop50ByStepTypeAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
-            ImageOperationStepType stepType,
+    List<ImageOperationStep> findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+            List<ImageOperationStepType> stepTypes,
             ImageOperationStepStatus status,
             LocalDateTime updatedAt
     );
