@@ -40,6 +40,10 @@ class ProfileImageServiceImplTest {
     private static final String SOURCE_KEY = "temp/user/profile.jpg";
     private static final String TARGET_KEY = "users/10/profile.fixed.jpg";
     private static final String OLD_KEY = "users/10/profile.old.jpg";
+    private static final Long CHAT_ROOM_ID = 20L;
+    private static final String CHAT_SOURCE_KEY = "temp/chat/profile.jpg";
+    private static final String CHAT_TARGET_KEY = "chatRoom/20/chat_profile.fixed.jpg";
+    private static final String CHAT_OLD_KEY = "chatRoom/20/chat_profile.old.jpg";
     private static final String CDN_BASE_URL = "https://cdn.example.com";
 
     @Mock
@@ -188,6 +192,59 @@ class ProfileImageServiceImplTest {
         }
     }
 
+    @Test
+    @DisplayName("채팅방 프로필 수정 성공 시 기존 이미지를 선삭제하지 않고 cleanup Outbox를 예약한다")
+    void updateChatRoomProfileImage_schedulesCleanupWithoutPreDelete() {
+        Image chatImage = prepareChatRoomStagingUpdate();
+        prepareChatRoomCopySuccess();
+
+        String result = profileImageService.updateChatRoomProfileImage(CHAT_ROOM_ID, CHAT_SOURCE_KEY);
+
+        assertThat(result).isEqualTo(CDN_BASE_URL + "/" + CHAT_TARGET_KEY);
+        assertThat(chatImage.getUrl()).isEqualTo(result);
+        verify(imageRepository).flush();
+        verify(imageRepository, never()).deleteByImageTypeAndRelatedIdWithFlushing(any(), any());
+        verify(storageClient, never()).deleteObjectsBulk(anyList());
+        verify(imageOperationRecoveryService).scheduleDeleteObjects(
+                operationId,
+                ImageOperationOwnerType.CHAT_ROOM,
+                CHAT_ROOM_ID,
+                List.of(CHAT_OLD_KEY, CHAT_SOURCE_KEY)
+        );
+    }
+
+    @Test
+    @DisplayName("채팅방 프로필 Copy 실패 시 기존 DB 이미지와 object를 유지한다")
+    void updateChatRoomProfileImage_keepsExistingImageWhenCopyFails() {
+        Image chatImage = prepareChatRoomStagingUpdate();
+        doThrow(new IllegalStateException("copy failed"))
+                .when(imageCopyExecutor).copy(CHAT_SOURCE_KEY, CHAT_TARGET_KEY);
+
+        assertThatThrownBy(() -> profileImageService.updateChatRoomProfileImage(CHAT_ROOM_ID, CHAT_SOURCE_KEY))
+                .isInstanceOf(BusinessException.class);
+
+        assertThat(chatImage.getUrl()).isEqualTo(CDN_BASE_URL + "/" + CHAT_OLD_KEY);
+        verify(imageOperationStepService).markTerminalFailed(stepId, "copy failed");
+        verify(imageOperationService).markFailed(operationId);
+        verify(imageRepository, never()).flush();
+        verify(imageRepository, never()).deleteByImageTypeAndRelatedIdWithFlushing(any(), any());
+        verify(storageClient, never()).deleteObjectsBulk(anyList());
+    }
+
+    @Test
+    @DisplayName("채팅방 프로필 Copy 성공 후 DB flush 실패 시 final object 보상을 예약한다")
+    void updateChatRoomProfileImage_createsCompensationWhenDbFails() {
+        prepareChatRoomStagingUpdate();
+        prepareChatRoomCopySuccess();
+        doThrow(new DataAccessResourceFailureException("db down")).when(imageRepository).flush();
+
+        assertThatThrownBy(() -> profileImageService.updateChatRoomProfileImage(CHAT_ROOM_ID, CHAT_SOURCE_KEY))
+                .isInstanceOf(DataAccessResourceFailureException.class);
+
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, CHAT_TARGET_KEY);
+        verify(storageClient, never()).deleteObjectsBulk(anyList());
+    }
+
     private void prepareStagingUpdate() {
         when(storageClient.isDefaultUrlOrKey(anyString())).thenReturn(false);
         when(storageClient.isStagingKey(SOURCE_KEY)).thenReturn(true);
@@ -212,5 +269,45 @@ class ProfileImageServiceImplTest {
         )).thenReturn(new ImageOperationService.CopyOperationPlan(operationId, stepId, TARGET_KEY));
         when(imageCopyExecutor.copyProfile(SOURCE_KEY, TARGET_KEY))
                 .thenReturn(new ImageCopyExecutor.ImageCopyResult(TARGET_KEY, "\"result-etag\""));
+    }
+
+    private Image prepareChatRoomStagingUpdate() {
+        Image chatImage = Image.of(
+                ImageType.CHAT_ROOM,
+                CHAT_ROOM_ID,
+                CDN_BASE_URL + "/" + CHAT_OLD_KEY,
+                0,
+                ImageModerationStatus.CLEAN,
+                null
+        );
+        when(storageClient.isDefaultUrlOrKey(anyString())).thenReturn(false);
+        when(storageClient.isStagingKey(CHAT_SOURCE_KEY)).thenReturn(true);
+        when(storageClient.extOf(CHAT_SOURCE_KEY)).thenReturn("jpg");
+        when(storageClient.headObject(CHAT_SOURCE_KEY)).thenReturn(
+                HeadObjectResponse.builder()
+                        .contentLength(2048L)
+                        .contentType("image/jpeg")
+                        .eTag("\"chat-source-etag\"")
+                        .build()
+        );
+        when(imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(
+                ImageType.CHAT_ROOM,
+                CHAT_ROOM_ID
+        )).thenReturn(Optional.of(chatImage));
+        when(imageOperationService.createCopyOperation(
+                eq(ImageOperationType.UPDATE_CHAT_ROOM_PROFILE_IMAGE),
+                eq(ImageOperationOwnerType.CHAT_ROOM),
+                eq(CHAT_ROOM_ID),
+                eq(CHAT_SOURCE_KEY),
+                anyString(),
+                eq("\"chat-source-etag\""),
+                eq(2048L)
+        )).thenReturn(new ImageOperationService.CopyOperationPlan(operationId, stepId, CHAT_TARGET_KEY));
+        return chatImage;
+    }
+
+    private void prepareChatRoomCopySuccess() {
+        when(imageCopyExecutor.copy(CHAT_SOURCE_KEY, CHAT_TARGET_KEY))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult(CHAT_TARGET_KEY, "\"chat-result-etag\""));
     }
 }
