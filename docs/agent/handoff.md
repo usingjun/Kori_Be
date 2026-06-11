@@ -52,10 +52,11 @@
 - 사용자 프로필 생성 성공 후 old/staging cleanup Outbox 적용
 - 사용자 프로필 삭제의 `DELETE_FOLDER + Outbox` 적용
 - 채팅방 프로필 생성 성공 후 staging cleanup Outbox 적용
+- 채팅방 프로필 삭제의 `DELETE_FOLDER + Outbox` 적용
 
 ### 현재 완료 상태
 
-사용자 프로필 생성·수정·삭제와 채팅방 프로필 생성·수정에 다음 구조가 적용돼 있다.
+사용자·채팅방 프로필 생성·수정·삭제에 다음 구조가 적용돼 있다.
 
 ```text
 사용자/채팅방 생성:
@@ -66,6 +67,10 @@ CREATE_USER_PROFILE_IMAGE 또는 CREATE_CHAT_ROOM_PROFILE_IMAGE로 staging Copy 
 사용자 삭제:
 Image row 삭제 + DELETE_FOLDER step + Outbox 저장
 → commit 후 Consumer가 folder 삭제
+
+채팅방 삭제:
+Image row 삭제 + DELETE_FOLDER step + Outbox 저장
+→ commit 후 Consumer가 chatRoom/{chatRoomId}/ folder 삭제
 ```
 
 실패 시 의미:
@@ -75,9 +80,10 @@ Image row 삭제 + DELETE_FOLDER step + Outbox 저장
 - 상위 채팅방 생성 transaction rollback: 생성된 final object에 compensation 삭제를 예약한다.
 - DB 성공: staging object 삭제를 공통 Outbox/Consumer가 처리한다.
 - 사용자 삭제 transaction rollback: DB 삭제와 folder cleanup Outbox가 함께 rollback된다.
+- 채팅방 삭제 transaction rollback: DB 삭제와 folder cleanup Outbox가 함께 rollback된다.
 
 `ProfileImageServiceImplTest`, `ImageOperationRecoveryServiceTest`, 이미지 관련 대상 테스트를 통과했다.
-`./scripts/agent-check.sh`는 153개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했으며, 이번 이미지 변경으로 확인된 실패는 없다.
+`./scripts/agent-check.sh`는 156개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했으며, 이번 이미지 변경으로 확인된 실패는 없다.
 
 ### 현재 데이터/메시지 흐름
 
@@ -115,10 +121,10 @@ Domain Service
 
 ### 즉시 이어갈 작업
 
-1. 채팅방 프로필 이미지 삭제 흐름과 상위 transaction 경계를 다시 확인한다.
-2. DB image 삭제와 `DELETE_FOLDER + Outbox`를 같은 transaction으로 저장한다.
-3. RabbitMQ 비활성화 fallback은 commit 이후에만 folder를 삭제하도록 유지한다.
-4. 관련 테스트와 문서를 갱신한다.
+1. `uploadUserProfileImage(MultipartFile)` 직접 `putObject` 흐름과 호출 transaction을 확인한다.
+2. `putObject` 성공 후 DB 저장 실패 시 final object compensation 방식을 설계한다.
+3. 직접 업로드 성공 후 moderation event와 operation 완료 경계를 확인한다.
+4. 구현 전 기존 API와 admin AI user 업로드 호출에 미치는 영향을 정리한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -130,18 +136,6 @@ staging Copy
 ```
 
 기존 API 응답과 key 생성 규칙은 유지해야 한다.
-
-### 채팅방 프로필 삭제 목표
-
-```text
-Image DB 삭제 또는 소유자 삭제 transaction
-+ 필요한 DELETE_OBJECT/DELETE_FOLDER step
-+ Outbox
-→ 같은 transaction commit
-→ Consumer가 실제 object/folder 삭제
-```
-
-삭제 전에 실제 domain transaction 경계와 cascade 동작을 코드에서 확인해야 한다. 확인되지 않은 경계를 추측해서 구현하면 안 된다.
 
 ### 이후 확장
 
@@ -158,11 +152,11 @@ Image DB 삭제 또는 소유자 삭제 transaction
 다음 Codex는 새 구현을 시작하기 전에 아래를 먼저 수행해야 한다.
 
 1. `git status --short`와 `git log -1 --oneline`으로 현재 상태를 확인한다.
-2. `deleteChatRoomProfileImage()`와 `ChatRoomService.deleteRoomIfEmpty()`의 transaction 경계를 확인한다.
-3. 구현 전 채팅방 folder 삭제 Outbox 적용 범위를 짧게 보고한다.
+2. `uploadUserProfileImage(MultipartFile)`와 호출 서비스의 transaction 경계를 확인한다.
+3. 직접 업로드 보상 정책을 구현 전에 짧게 보고한다.
 4. 구현 후 이미지 대상 테스트와 `git diff --check`를 실행한다.
 
-새 구현의 첫 대상은 채팅방 프로필 이미지 **삭제**다.
+새 구현의 첫 대상은 `uploadUserProfileImage(MultipartFile)` 직접 업로드 보상 처리다.
 
 ## 수정하면 안 되는 부분
 
@@ -197,7 +191,7 @@ Image DB 삭제 또는 소유자 삭제 transaction
 
 ## 현재 판단이 필요한 사항
 
-- 채팅방 삭제 시 `DELETE_OBJECT`와 `DELETE_FOLDER` 중 정확히 어떤 범위를 사용할지는 실제 key 소유권과 삭제 호출 경계를 확인한 뒤 결정해야 한다.
+- 채팅방 삭제는 기존 folder 범위를 유지해 `DELETE_FOLDER`로 처리한다.
 - Outbox 즉시 발행은 지연 개선 목적으로 추가할 수 있지만, polling relay는 유실 복구 fallback으로 유지해야 한다.
 - 다중 서버 Outbox claim은 현재 단일 서버이므로 보류했다. 향후 같은 DB를 공유하는 다중 인스턴스가 생기면 다시 설계해야 한다.
 - `COPY_STAGING_TO_FINAL`의 완전 비동기 retry는 `REGISTER_IMAGE_DB` 없이 단독 구현하면 안 된다.

@@ -4,7 +4,7 @@
 
 - 기준 브랜치: `feat/image-idempotency`
 - 마지막 완료 커밋은 `git log -1 --oneline`으로 확인한다.
-- 현재 구현 단계: 사용자 프로필 생성·수정·삭제와 채팅방 프로필 생성·수정 안정화 완료
+- 현재 구현 단계: 사용자·채팅방 프로필 생성·수정·삭제 안정화 완료
 - 작업 전 `AGENTS.md`, `docs/agent/project-context.md`, 인수인계 문서를 확인한다.
 - 이 문서는 이미지 생성·수정·삭제 흐름을 공통 `ImageOperation` 구조로 점진 통합하는 작업의 진행 상태를 기록한다.
 
@@ -76,22 +76,28 @@ FailedImageCleanup 저장
 - DB 반영 성공 후 staging object 삭제를 Outbox로 예약한다.
 - 이미 final key인 요청은 기존처럼 Copy 없이 저장한다.
 
-### 8. 검증 완료
+### 8. 채팅방 프로필 이미지 삭제
+
+- `deleteChatRoomProfileImage()`의 DB row 삭제와 `DELETE_FOLDER + Outbox`를 같은 transaction에서 처리한다.
+- 실제 `chatRoom/{chatRoomId}/` folder 삭제는 transaction commit 후 Consumer가 수행한다.
+- RabbitMQ 비활성화 fallback도 commit 이후에만 folder를 삭제한다.
+- 상위 `ChatRoomService.leaveRoom()` transaction이 rollback되면 DB 삭제와 Outbox가 함께 rollback된다.
+
+### 9. 검증 완료
 
 - 이미지 관련 대상 테스트가 통과했다.
-- `./scripts/agent-check.sh`는 153개 중 18개가 실패했다.
+- `./scripts/agent-check.sh`는 156개 중 18개가 실패했다.
 - 전체 테스트 실패는 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"` 때문이다.
 - 이번 이미지 변경으로 확인된 테스트 실패는 없다.
 
 ## 현재 진행 중인 작업
 
-- 없음. 다음 구현 대상은 채팅방 프로필 이미지 삭제 안정화다.
+- 없음. 다음 구현 대상은 `uploadUserProfileImage(MultipartFile)` 직접 업로드 보상 정책이다.
 
 ## 남은 작업
 
 ### 가까운 범위
 
-- 채팅방 프로필 이미지 삭제 흐름에 DB 변경과 `DELETE_FOLDER` 또는 필요한 삭제 step의 Outbox 저장 적용
 - `uploadUserProfileImage(MultipartFile)` 직접 업로드 후 DB 실패 보상 정책 설계
 - Outbox 발행 지연 개선: transaction commit 직후 즉시 발행을 시도하고 현재 polling relay는 fallback으로 유지
 
@@ -113,9 +119,8 @@ FailedImageCleanup 저장
 
 ## 다음 우선순위 작업
 
-1. 채팅방 프로필 이미지 **삭제**에 DB 변경과 삭제 Outbox를 같은 transaction으로 저장한다.
-2. `uploadUserProfileImage(MultipartFile)` 직접 업로드 흐름의 보상 정책을 결정한다.
-3. Outbox 발행 지연을 줄이되 polling relay를 fallback으로 유지한다.
-4. 이후 Post/Poll의 생성·수정·삭제 흐름으로 확장한다.
+1. `uploadUserProfileImage(MultipartFile)` 직접 업로드 흐름의 보상 정책을 결정한다.
+2. Outbox 발행 지연을 줄이되 polling relay를 fallback으로 유지한다.
+3. 이후 Post/Poll의 생성·수정·삭제 흐름으로 확장한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.

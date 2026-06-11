@@ -356,17 +356,8 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     @Transactional
     @Override
     public void deleteChatRoomProfileImage(Long chatRoomId) {
-
-        String folder = "chatRoom/%d/".formatted(chatRoomId);
-        try {
-            // 같은 클래스 내에 deleteFolder가 있다면 그대로 호출
-            storageClient.deleteFolder(folder);
-        } catch (BusinessException e) {
-            // 폴더 삭제 실패는 경고만 남기고, 아래 레거시 개별 삭제도 시도
-            log.warn("profile folder delete failed (ignored): {}", e.getMessage());
-        }
-
         imageRepository.deleteByImageTypeAndRelatedId(ImageType.CHAT_ROOM, chatRoomId);
+        scheduleFolderCleanup(ImageOperationOwnerType.CHAT_ROOM, chatRoomId, "chatRoom/%d/".formatted(chatRoomId));
     }
 
     @Override

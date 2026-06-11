@@ -304,6 +304,58 @@ class ProfileImageServiceImplTest {
     }
 
     @Test
+    @DisplayName("채팅방 프로필 삭제 시 DB 삭제와 folder cleanup Outbox를 예약한다")
+    void deleteChatRoomProfileImage_schedulesFolderCleanup() {
+        profileImageService.deleteChatRoomProfileImage(CHAT_ROOM_ID);
+
+        verify(imageRepository).deleteByImageTypeAndRelatedId(ImageType.CHAT_ROOM, CHAT_ROOM_ID);
+        verify(imageOperationRecoveryService).scheduleDeleteFolder(
+                ImageOperationOwnerType.CHAT_ROOM,
+                CHAT_ROOM_ID,
+                "chatRoom/20/"
+        );
+        verify(storageClient, never()).deleteFolder(anyString());
+    }
+
+    @Test
+    @DisplayName("RabbitMQ 비활성화 시 채팅방 folder 삭제는 transaction commit 이후 실행한다")
+    void deleteChatRoomProfileImage_deletesFolderAfterCommitWhenRabbitDisabled() {
+        ReflectionTestUtils.setField(profileImageService, "imageOperationRabbitEnabled", false);
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            profileImageService.deleteChatRoomProfileImage(CHAT_ROOM_ID);
+
+            verify(storageClient, never()).deleteFolder(anyString());
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(TransactionSynchronization::afterCommit);
+
+            verify(storageClient).deleteFolder("chatRoom/20/");
+            verify(imageOperationRecoveryService, never()).scheduleDeleteFolder(any(), any(), anyString());
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
+    @DisplayName("RabbitMQ 비활성화 시 채팅방 삭제 transaction rollback이면 folder를 삭제하지 않는다")
+    void deleteChatRoomProfileImage_keepsFolderWhenTransactionRollsBack() {
+        ReflectionTestUtils.setField(profileImageService, "imageOperationRabbitEnabled", false);
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            profileImageService.deleteChatRoomProfileImage(CHAT_ROOM_ID);
+
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(synchronization ->
+                            synchronization.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK));
+
+            verify(storageClient, never()).deleteFolder(anyString());
+            verify(imageOperationRecoveryService, never()).scheduleDeleteFolder(any(), any(), anyString());
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
     @DisplayName("채팅방 프로필 수정 성공 시 기존 이미지를 선삭제하지 않고 cleanup Outbox를 예약한다")
     void updateChatRoomProfileImage_schedulesCleanupWithoutPreDelete() {
         Image chatImage = prepareChatRoomStagingUpdate();

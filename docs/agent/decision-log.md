@@ -188,7 +188,7 @@ operation 완료 여부는 관련 step 전체 상태로 판정해야 한다. 보
 
 ### 결정
 
-최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자 프로필 생성·수정·삭제와 채팅방 프로필 생성·수정까지 진행했으며, 채팅방 삭제와 Post/Poll은 후속 단계다.
+최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자·채팅방 프로필 생성·수정·삭제까지 진행했으며, 직접 MultipartFile 업로드와 Post/Poll은 후속 단계다.
 
 ### 이유
 
@@ -273,3 +273,4 @@ operation 완료 여부는 관련 step 전체 상태로 판정해야 한다. 보
 
 - folder 삭제 범위는 기존 `users/{userId}/`, `chatRoom/{chatRoomId}/` 규칙을 유지해야 한다.
 - 소유자 삭제 transaction에서 호출되더라도 Outbox가 같은 transaction에 참여해야 한다.
+- 채팅방 삭제는 `ChatRoomService.leaveRoom()`의 상위 transaction에 참여하므로 실제 folder 삭제를 commit 전에 실행하면 안 된다.
