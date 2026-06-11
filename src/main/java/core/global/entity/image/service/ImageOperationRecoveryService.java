@@ -112,6 +112,31 @@ public class ImageOperationRecoveryService {
         return operation.getOperationId();
     }
 
+    @Transactional
+    public UUID scheduleDeleteFolder(
+            ImageOperationOwnerType ownerType,
+            Long ownerId,
+            String targetPrefix
+    ) {
+        ImageOperation operation = operationRepository.save(
+                ImageOperation.create(
+                        ImageOperationType.CLEANUP_ONLY,
+                        ownerType,
+                        ownerId
+                )
+        );
+        operation.markProcessing();
+        ImageOperationStep step = stepRepository.save(
+                ImageOperationStep.createDeleteFolderStep(
+                        operation.getOperationId(),
+                        targetPrefix,
+                        DEFAULT_CLEANUP_MAX_ATTEMPTS
+                )
+        );
+        outboxRepository.save(outbox(step, 0, ImageOperationMessageDestination.INITIAL));
+        return operation.getOperationId();
+    }
+
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public UUID scheduleFailedCleanup(
             Long failedCleanupId,

@@ -3,9 +3,9 @@
 ## 현재 기준
 
 - 기준 브랜치: `feat/image-idempotency`
-- 마지막 완료 커밋: `1e0753d0 feat: unify image cleanup with operation outbox`
-- 현재 미커밋 작업: 채팅방 프로필 이미지 수정 흐름의 Copy 추적, 보상 삭제, cleanup Outbox 적용
-- `AGENTS.md`는 현재 저장소와 상위 경로에서 확인되지 않았다.
+- 마지막 완료 커밋은 `git log -1 --oneline`으로 확인한다.
+- 현재 구현 단계: 사용자 프로필 생성·수정·삭제와 채팅방 프로필 생성·수정 안정화 완료
+- 작업 전 `AGENTS.md`, `docs/agent/project-context.md`, 인수인계 문서를 확인한다.
 - 이 문서는 이미지 생성·수정·삭제 흐름을 공통 `ImageOperation` 구조로 점진 통합하는 작업의 진행 상태를 기록한다.
 
 ## 완료된 작업
@@ -54,47 +54,45 @@ FailedImageCleanup 저장
 - DB 반영 성공 후 old/staging object 삭제를 Outbox로 예약한다.
 - API 응답, CDN URL, object key 규칙은 유지한다.
 
-### 5. 검증 완료
+### 5. 채팅방 프로필 이미지 수정
 
-- 이미지 관련 대상 테스트 70개가 통과했다.
-- 전체 테스트는 141개 중 18개가 실패했다.
+- 기존 object를 새 이미지 반영 전에 삭제하지 않는다.
+- staging Copy를 `UPDATE_CHAT_ROOM_PROFILE_IMAGE` operation으로 추적한다.
+- Copy 성공 후 DB 반영 실패 시 final object 보상 삭제를 예약한다.
+- DB 반영 성공 후 old/staging object 삭제를 Outbox로 예약한다.
+
+### 6. 사용자 프로필 이미지 생성·삭제
+
+- `saveUserProfileImage()`의 staging Copy를 `CREATE_USER_PROFILE_IMAGE` operation으로 추적한다.
+- Copy 성공 후 DB 반영 실패 시 final object 보상 삭제를 예약한다.
+- DB 반영 성공 후 old/staging object 삭제를 Outbox로 예약한다.
+- `deleteUserProfileImage()`의 DB row 삭제와 `DELETE_FOLDER + Outbox`를 같은 transaction에서 처리한다.
+- RabbitMQ 비활성화 시에도 사용자 folder 삭제는 transaction commit 이후에만 실행한다.
+
+### 7. 채팅방 프로필 이미지 생성
+
+- staging Copy를 `CREATE_CHAT_ROOM_PROFILE_IMAGE` operation으로 추적한다.
+- Copy 성공 후 DB 반영 실패 또는 상위 transaction rollback 시 final object 보상 삭제를 예약한다.
+- DB 반영 성공 후 staging object 삭제를 Outbox로 예약한다.
+- 이미 final key인 요청은 기존처럼 Copy 없이 저장한다.
+
+### 8. 검증 완료
+
+- 이미지 관련 대상 테스트가 통과했다.
+- `./scripts/agent-check.sh`는 153개 중 18개가 실패했다.
 - 전체 테스트 실패는 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"` 때문이다.
 - 이번 이미지 변경으로 확인된 테스트 실패는 없다.
 
 ## 현재 진행 중인 작업
 
-### 채팅방 프로필 이미지 수정 안정화
-
-현재 다음 두 파일이 미커밋 상태다.
-
-- `src/main/java/core/global/entity/image/service/impl/ProfileImageServiceImpl.java`
-- `src/test/java/core/global/entity/image/service/impl/ProfileImageServiceImplTest.java`
-
-적용한 흐름:
-
-```text
-staging 검증
-→ Copy operation/step 생성
-→ Copy 실행
-→ Image DB URL 변경 및 flush
-→ old/staging DELETE_OBJECT step + Outbox 저장
-```
-
-실패 처리:
-
-- Copy 실패: 기존 DB 이미지와 기존 object를 유지한다.
-- Copy 성공 후 DB flush 실패: 새 final object의 보상 삭제를 예약한다.
-- DB 성공: old/staging object를 직접 삭제하지 않고 Outbox로 비동기 삭제한다.
-
-현재 구현과 테스트는 완료됐지만 아직 커밋하지 않았다.
+- 없음. 다음 구현 대상은 채팅방 프로필 이미지 삭제 안정화다.
 
 ## 남은 작업
 
 ### 가까운 범위
 
-- 현재 채팅방 프로필 이미지 수정 변경사항 검토 후 커밋
-- 채팅방 프로필 이미지 생성 흐름에 Copy 추적과 DB 실패 보상 적용
 - 채팅방 프로필 이미지 삭제 흐름에 DB 변경과 `DELETE_FOLDER` 또는 필요한 삭제 step의 Outbox 저장 적용
+- `uploadUserProfileImage(MultipartFile)` 직접 업로드 후 DB 실패 보상 정책 설계
 - Outbox 발행 지연 개선: transaction commit 직후 즉시 발행을 시도하고 현재 polling relay는 fallback으로 유지
 
 ### 다음 확장 범위
@@ -115,10 +113,9 @@ staging 검증
 
 ## 다음 우선순위 작업
 
-1. 현재 미커밋 채팅방 프로필 이미지 수정 변경사항을 다시 검토하고 커밋한다.
-2. 채팅방 프로필 이미지 **생성**에 Copy 성공 후 DB 실패 보상을 적용한다.
-3. 채팅방 프로필 이미지 **삭제**에 DB 변경과 삭제 Outbox를 같은 transaction으로 저장한다.
-4. Outbox 발행 지연을 줄이되 polling relay를 fallback으로 유지한다.
-5. 이후 Post/Poll의 생성·수정·삭제 흐름으로 확장한다.
+1. 채팅방 프로필 이미지 **삭제**에 DB 변경과 삭제 Outbox를 같은 transaction으로 저장한다.
+2. `uploadUserProfileImage(MultipartFile)` 직접 업로드 흐름의 보상 정책을 결정한다.
+3. Outbox 발행 지연을 줄이되 polling relay를 fallback으로 유지한다.
+4. 이후 Post/Poll의 생성·수정·삭제 흐름으로 확장한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.

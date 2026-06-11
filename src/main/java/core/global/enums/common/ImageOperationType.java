@@ -1,7 +1,9 @@
 package core.global.enums.common;
 
 public enum ImageOperationType {
+    CREATE_USER_PROFILE_IMAGE,
     UPDATE_USER_PROFILE_IMAGE,
+    CREATE_CHAT_ROOM_PROFILE_IMAGE,
     UPDATE_CHAT_ROOM_PROFILE_IMAGE,
     CREATE_POST_IMAGES,
     UPDATE_POST_IMAGES,

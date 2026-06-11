@@ -188,7 +188,7 @@ operation 완료 여부는 관련 step 전체 상태로 판정해야 한다. 보
 
 ### 결정
 
-최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자 프로필 수정과 채팅방 프로필 수정까지 진행했으며, 채팅방 생성·삭제와 Post/Poll은 후속 단계다.
+최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자 프로필 생성·수정·삭제와 채팅방 프로필 생성·수정까지 진행했으며, 채팅방 삭제와 Post/Poll은 후속 단계다.
 
 ### 이유
 
@@ -207,3 +207,69 @@ operation 완료 여부는 관련 step 전체 상태로 판정해야 한다. 보
 - DB 성공 후 cleanup publish 실패
 - Consumer 중복 실행
 - Consumer 처리 중 종료 및 timeout 복구
+
+## 11. 채팅방 프로필 생성과 수정은 복구 구조를 공유하되 operation type을 분리한다
+
+### 결정
+
+- 생성과 수정 모두 동기 Copy, DB flush, cleanup Outbox, rollback compensation 구조를 사용한다.
+- 생성은 `CREATE_CHAT_ROOM_PROFILE_IMAGE`, 수정은 `UPDATE_CHAT_ROOM_PROFILE_IMAGE`로 추적한다.
+
+### 이유
+
+실행 단계와 복구 방식은 같지만 장애 의미가 다르다. 생성 실패는 아직 이미지가 없는 상태를 유지해야 하고, 수정 실패는 기존 이미지를 유지해야 한다. operation type을 분리하면 운영 조회와 장애 분석에서 두 상황을 구분할 수 있다.
+
+### 채택하지 않은 대안
+
+- 생성과 수정을 모두 `UPDATE_CHAT_ROOM_PROFILE_IMAGE`로 기록
+- 생성 전용 복구 서비스를 별도로 구현
+
+### 변경 시 주의
+
+- 생성 성공 후 cleanup 대상은 staging object뿐이다.
+- 수정 성공 후 cleanup 대상은 old object와 staging object다.
+- 생성이 포함된 상위 `ChatRoomService.createGroupChatRoom()` transaction이 rollback되면 final object compensation이 필요하다.
+
+## 12. 사용자 프로필 생성과 수정도 복구 구조를 공유하되 operation type을 분리한다
+
+### 결정
+
+- `saveUserProfileImage()`는 기존 upsert 동작을 유지하면서 `CREATE_USER_PROFILE_IMAGE`로 추적한다.
+- `updateUserProfileImage()`는 `UPDATE_USER_PROFILE_IMAGE`로 추적한다.
+- 두 흐름 모두 Copy 성공 후 DB 실패 보상과 성공 후 old/staging cleanup Outbox를 사용한다.
+
+### 이유
+
+`saveUserProfileImage()`는 실제 코드상 기존 이미지가 있으면 갱신하는 upsert다. 기존 동작을 바꾸지 않으면서 운영상 초기 설정과 명시적 수정을 구분하기 위해 operation type만 분리한다.
+
+### 채택하지 않은 대안
+
+- `saveUserProfileImage()`에서 기존 이미지가 있으면 오류 처리
+- 생성과 수정을 모두 `UPDATE_USER_PROFILE_IMAGE`로 기록
+
+### 변경 시 주의
+
+- `saveUserProfileImage()`의 기존 upsert 동작과 moderation event 발행을 유지해야 한다.
+- `uploadUserProfileImage(MultipartFile)`는 staging Copy가 아닌 직접 `putObject` 흐름이므로 별도 보상 설계가 필요하다.
+
+## 13. 프로필 삭제는 DB 삭제 후 동기 folder 삭제 대신 Outbox를 사용한다
+
+### 결정
+
+- 프로필 `Image` row 삭제와 `DELETE_FOLDER + Outbox` 저장을 같은 transaction에서 처리한다.
+- 실제 folder 삭제는 commit 이후 Consumer가 수행한다.
+- RabbitMQ 비활성화 시 직접 삭제 fallback도 commit 이후에만 실행한다.
+
+### 이유
+
+기존처럼 transaction 안에서 S3 folder를 먼저 삭제하면 이후 DB transaction rollback 시 DB row는 복원되지만 object는 이미 사라지는 정합성 문제가 발생한다.
+
+### 채택하지 않은 대안
+
+- DB row 삭제 직후 S3 folder 동기 삭제
+- folder 삭제 실패를 로그만 남기고 무시
+
+### 변경 시 주의
+
+- folder 삭제 범위는 기존 `users/{userId}/`, `chatRoom/{chatRoomId}/` 규칙을 유지해야 한다.
+- 소유자 삭제 transaction에서 호출되더라도 Outbox가 같은 transaction에 참여해야 한다.

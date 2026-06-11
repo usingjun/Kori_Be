@@ -171,6 +171,33 @@ class ImageOperationRecoveryServiceTest {
     }
 
     @Test
+    @DisplayName("DELETE_FOLDER cleanup operation과 초기 Outbox를 생성한다")
+    void scheduleDeleteFolder_createsCleanupOperation() {
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID operationId = recoveryService.scheduleDeleteFolder(
+                ImageOperationOwnerType.USER,
+                10L,
+                "users/10/"
+        );
+
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        ArgumentCaptor<ImageOperationPublishOutbox> outboxCaptor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        verify(stepRepository).save(stepCaptor.capture());
+        verify(outboxRepository).save(outboxCaptor.capture());
+        assertThat(operationId).isEqualTo(operationCaptor.getValue().getOperationId());
+        assertThat(operationCaptor.getValue().getOperationType()).isEqualTo(ImageOperationType.CLEANUP_ONLY);
+        assertThat(operationCaptor.getValue().getStatus()).isEqualTo(ImageOperationStatus.PROCESSING);
+        assertThat(stepCaptor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+        assertThat(stepCaptor.getValue().getTargetKey()).isEqualTo("users/10/");
+        assertThat(outboxCaptor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+    }
+
+    @Test
     @DisplayName("FailedImageCleanup DELETE_FOLDER를 공통 CLEANUP_ONLY operation과 Outbox로 예약한다")
     void scheduleFailedCleanup_createsDeleteFolderOperation() {
         when(stepRepository.findFirstByStepTypeAndTargetKeyOrderByCreatedAtDesc(

@@ -84,30 +84,48 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         RequestInfo requestInfo = resolveRequestInfo(requestedKeyOrUrl);
 
         // 3) 기본이미지가 아니면 헤더 검사(용량 제한 포함)
-        validateImageHeadIfNecessary(requestInfo);
+        HeadObjectResponse sourceHead = validateImageHeadIfNecessary(requestInfo);
 
         // 5) 최종 후보 키/URL 계산 (버전드 키 전략)
         String candidateFinalKey = computeCandidateFinalKey(userId, requestInfo);
-        String finalKey = moveStagingProfileIfNecessary(userId, requestInfo, candidateFinalKey);
-        String finalUrl = buildCdnUrlFromKey(cdnBaseUrl, finalKey);
-
-        Image targetImage = imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId)
+        Optional<Image> existingOpt =
+                imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId);
+        String oldKey = existingOpt
+                .map(Image::getUrl)
+                .filter(url -> !storageClient.isDefaultUrlOrKey(url))
+                .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
                 .orElse(null);
-
-        if (targetImage != null) {
-            // A. 이미 존재하면 -> URL 업데이트
-            log.info("[Profile Setup] 기존 이미지 업데이트 - ID: {}, New URL: {}", targetImage.getId(), finalUrl);
-            targetImage.updateUrl(finalUrl);
-        } else {
-            // B. 없으면 -> 새로 생성 및 저장
-            log.info("[Profile Setup] 새 이미지 생성 및 저장 - userId: {}", userId);
-            // saveImageInDB가 저장된 엔티티를 반환하도록 수정해야 합니다.
-            saveImageInDB(userId, ImageType.USER, finalKey);
-
-            targetImage = imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId)
-                    .orElse(null);
+        ImageOperationService.CopyOperationPlan copyPlan = null;
+        String finalKey = candidateFinalKey;
+        if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
+            copyPlan = copyProfileImage(
+                    ImageOperationType.CREATE_USER_PROFILE_IMAGE,
+                    userId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
+            finalKey = copyPlan.targetKey();
         }
 
+        Image targetImage;
+        try {
+            targetImage = upsertProfileImageEntityAndFlush(userId, ImageType.USER, existingOpt, finalKey);
+        } catch (RuntimeException e) {
+            if (copyPlan != null) {
+                createCompensation(copyPlan, finalKey);
+            }
+            throw e;
+        }
+
+        scheduleCleanupAndRollbackCompensation(
+                ImageOperationOwnerType.USER,
+                userId,
+                oldKey,
+                requestInfo,
+                finalKey,
+                copyPlan
+        );
         publishImageModerationEvent(finalKey, targetImage);
         log.info("[Profile Setup] 유저 프로필 이미지 저장 성공 - userId: {}, finalKey: {}", userId, finalKey);
     }
@@ -159,7 +177,13 @@ public class ProfileImageServiceImpl implements ProfileImageService {
                 .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
                 .orElse(null);
         if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
-            copyPlan = copyProfileImage(userId, requestInfo, candidateFinalKey, sourceHead);
+            copyPlan = copyProfileImage(
+                    ImageOperationType.UPDATE_USER_PROFILE_IMAGE,
+                    userId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
             finalKey = copyPlan.targetKey();
         }
 
@@ -189,16 +213,8 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     @Override
     @Transactional
     public void deleteUserProfileImage(Long userId) {
-
         imageRepository.deleteByImageTypeAndRelatedId(ImageType.USER, userId);
-        String folder = "users/%d/".formatted(userId);
-        try {
-            // 같은 클래스 내에 deleteFolder가 있다면 그대로 호출
-            storageClient.deleteFolder(folder);
-        } catch (BusinessException e) {
-            // 폴더 삭제 실패는 경고만 남기고, 아래 레거시 개별 삭제도 시도
-            log.warn("profile folder delete failed (ignored): {}", e.getMessage());
-        }
+        scheduleFolderCleanup(ImageOperationOwnerType.USER, userId, "users/%d/".formatted(userId));
     }
 
     @Override
@@ -229,16 +245,41 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         RequestInfo requestInfo = resolveRequestInfo(requestedKeyOrUrl);
 
         // 3) 기본이미지가 아니면 헤더 검사(용량 제한 포함)
-        validateImageHeadIfNecessary(requestInfo);
+        HeadObjectResponse sourceHead = validateImageHeadIfNecessary(requestInfo);
 
         // 5) 최종 후보 키/URL 계산
         String candidateFinalKey = computeChatRoomCandidateFinalKey(chatRoomId, requestInfo);
 
-        // 9) staging → 영구 이동 또는 as-is 사용
-        String finalKey = moveChatRoomStagingIfNecessary(chatRoomId, requestInfo, candidateFinalKey);
+        ImageOperationService.CopyOperationPlan copyPlan = null;
+        String finalKey = candidateFinalKey;
+        if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
+            copyPlan = copyChatRoomProfileImage(
+                    ImageOperationType.CREATE_CHAT_ROOM_PROFILE_IMAGE,
+                    chatRoomId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
+            finalKey = copyPlan.targetKey();
+        }
 
-        // 10) 저장 및 종료
-        saveImageInDB(chatRoomId, ImageType.CHAT_ROOM, finalKey);
+        try {
+            upsertProfileImageAndFlush(chatRoomId, ImageType.CHAT_ROOM, Optional.empty(), finalKey);
+        } catch (RuntimeException e) {
+            if (copyPlan != null) {
+                createCompensation(copyPlan, finalKey);
+            }
+            throw e;
+        }
+
+        scheduleCleanupAndRollbackCompensation(
+                ImageOperationOwnerType.CHAT_ROOM,
+                chatRoomId,
+                null,
+                requestInfo,
+                finalKey,
+                copyPlan
+        );
     }
 
     /**
@@ -281,7 +322,13 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         ImageOperationService.CopyOperationPlan copyPlan = null;
         String finalKey = candidateFinalKey;
         if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
-            copyPlan = copyChatRoomProfileImage(chatRoomId, requestInfo, candidateFinalKey, sourceHead);
+            copyPlan = copyChatRoomProfileImage(
+                    ImageOperationType.UPDATE_CHAT_ROOM_PROFILE_IMAGE,
+                    chatRoomId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
             finalKey = copyPlan.targetKey();
         }
 
@@ -447,13 +494,14 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     }
 
     private ImageOperationService.CopyOperationPlan copyProfileImage(
+            ImageOperationType operationType,
             Long userId,
             RequestInfo requestInfo,
             String targetKey,
             HeadObjectResponse sourceHead
     ) {
         ImageOperationService.CopyOperationPlan plan = imageOperationService.createCopyOperation(
-                ImageOperationType.UPDATE_USER_PROFILE_IMAGE,
+                operationType,
                 ImageOperationOwnerType.USER,
                 userId,
                 requestInfo.getReqKey(),
@@ -477,13 +525,14 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     }
 
     private ImageOperationService.CopyOperationPlan copyChatRoomProfileImage(
+            ImageOperationType operationType,
             Long chatRoomId,
             RequestInfo requestInfo,
             String targetKey,
             HeadObjectResponse sourceHead
     ) {
         ImageOperationService.CopyOperationPlan plan = imageOperationService.createCopyOperation(
-                ImageOperationType.UPDATE_CHAT_ROOM_PROFILE_IMAGE,
+                operationType,
                 ImageOperationOwnerType.CHAT_ROOM,
                 chatRoomId,
                 requestInfo.getReqKey(),
@@ -584,16 +633,57 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             Optional<Image> existingOpt,
             String finalKey
     ) {
+        upsertProfileImageEntityAndFlush(relatedId, imageType, existingOpt, finalKey);
+        return buildCdnUrlFromKey(cdnBaseUrl, finalKey);
+    }
+
+    private Image upsertProfileImageEntityAndFlush(
+            Long relatedId,
+            ImageType imageType,
+            Optional<Image> existingOpt,
+            String finalKey
+    ) {
         String finalUrl = buildCdnUrlFromKey(cdnBaseUrl, finalKey);
+        Image image;
         if (existingOpt.isPresent()) {
-            existingOpt.get().updateUrl(finalUrl);
+            image = existingOpt.get();
+            image.updateUrl(finalUrl);
         } else {
-            imageRepository.save(
+            image = imageRepository.save(
                     Image.of(imageType, relatedId, finalUrl, 0, ImageModerationStatus.CLEAN, null)
             );
         }
         imageRepository.flush();
-        return finalUrl;
+        return image;
+    }
+
+    private void scheduleFolderCleanup(
+            ImageOperationOwnerType ownerType,
+            Long ownerId,
+            String folder
+    ) {
+        if (imageOperationRabbitEnabled) {
+            imageOperationRecoveryService.scheduleDeleteFolder(ownerType, ownerId, folder);
+            return;
+        }
+
+        Runnable cleanup = () -> {
+            try {
+                storageClient.deleteFolder(folder);
+            } catch (RuntimeException e) {
+                log.error("[ImageCleanup] direct folder cleanup fallback failed folder={}", folder, e);
+            }
+        };
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            cleanup.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                cleanup.run();
+            }
+        });
     }
 
     private void createCompensation(

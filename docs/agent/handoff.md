@@ -27,17 +27,13 @@
 5. `docs/agent/image-operation-rabbitmq-phase1-operations.md`
 6. `docs/agent/image-operation-state-machine-summary.md`
 
-현재 저장소와 상위 경로에서 `AGENTS.md`는 확인되지 않았다.
+작업 전 저장소 루트의 `AGENTS.md`와 `docs/agent/project-context.md`를 먼저 확인한다.
 
 ## 현재 구현 상태
 
 ### 커밋 완료 상태
 
-현재 브랜치는 `feat/image-idempotency`이며, 마지막 완료 커밋은 다음과 같다.
-
-```text
-1e0753d0 feat: unify image cleanup with operation outbox
-```
+현재 브랜치는 `feat/image-idempotency`이며, 마지막 완료 커밋은 `git log -1 --oneline`으로 확인한다.
 
 이 커밋까지 포함된 주요 기능:
 
@@ -52,36 +48,36 @@
 - 일반 cleanup 실패를 공통 `CLEANUP_ONLY` operation으로 통합
 - `FailedImageCleanupScheduler` fallback 유지
 - 사용자 프로필 수정 성공 후 old/staging cleanup Outbox 적용
+- 채팅방 프로필 수정 성공 후 old/staging cleanup Outbox 적용
+- 사용자 프로필 생성 성공 후 old/staging cleanup Outbox 적용
+- 사용자 프로필 삭제의 `DELETE_FOLDER + Outbox` 적용
+- 채팅방 프로필 생성 성공 후 staging cleanup Outbox 적용
 
-### 현재 미커밋 상태
+### 현재 완료 상태
 
-다음 production/test 파일에 채팅방 프로필 이미지 **수정** 안정화가 구현돼 있다.
-
-- `src/main/java/core/global/entity/image/service/impl/ProfileImageServiceImpl.java`
-- `src/test/java/core/global/entity/image/service/impl/ProfileImageServiceImplTest.java`
-
-현재 변경의 의도:
+사용자 프로필 생성·수정·삭제와 채팅방 프로필 생성·수정에 다음 구조가 적용돼 있다.
 
 ```text
-기존:
-old object 선삭제
-→ staging Copy
-→ 기존 Image row 삭제
-→ 새 Image row 저장
+사용자/채팅방 생성:
+CREATE_USER_PROFILE_IMAGE 또는 CREATE_CHAT_ROOM_PROFILE_IMAGE로 staging Copy 추적
+→ Image row 저장 및 flush
+→ staging 삭제를 Outbox로 예약
 
-변경:
-staging Copy 추적
-→ 기존 Image row URL 갱신 또는 새 row 저장
-→ old/staging 삭제를 Outbox로 예약
+사용자 삭제:
+Image row 삭제 + DELETE_FOLDER step + Outbox 저장
+→ commit 후 Consumer가 folder 삭제
 ```
 
 실패 시 의미:
 
-- Copy 실패: 기존 DB 이미지와 old object를 유지한다.
+- Copy 실패: Image row를 저장하지 않고 staging object를 유지한다.
 - Copy 성공 후 DB flush 실패: 생성된 final object에 compensation 삭제를 예약한다.
-- DB 성공: old/staging object 삭제를 공통 Outbox/Consumer가 처리한다.
+- 상위 채팅방 생성 transaction rollback: 생성된 final object에 compensation 삭제를 예약한다.
+- DB 성공: staging object 삭제를 공통 Outbox/Consumer가 처리한다.
+- 사용자 삭제 transaction rollback: DB 삭제와 folder cleanup Outbox가 함께 rollback된다.
 
-현재 미커밋 변경은 이미지 관련 대상 테스트 70개를 통과했다.
+`ProfileImageServiceImplTest`, `ImageOperationRecoveryServiceTest`, 이미지 관련 대상 테스트를 통과했다.
+`./scripts/agent-check.sh`는 153개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했으며, 이번 이미지 변경으로 확인된 실패는 없다.
 
 ### 현재 데이터/메시지 흐름
 
@@ -119,11 +115,10 @@ Domain Service
 
 ### 즉시 이어갈 작업
 
-1. 현재 미커밋 채팅방 프로필 수정 변경사항을 검토한다.
-2. 대상 테스트와 `git diff --check`를 다시 실행한다.
-3. 사용자 확인 후 현재 변경을 독립 커밋으로 남긴다.
-4. 채팅방 프로필 이미지 생성 흐름을 안정화한다.
-5. 채팅방 프로필 이미지 삭제 흐름을 안정화한다.
+1. 채팅방 프로필 이미지 삭제 흐름과 상위 transaction 경계를 다시 확인한다.
+2. DB image 삭제와 `DELETE_FOLDER + Outbox`를 같은 transaction으로 저장한다.
+3. RabbitMQ 비활성화 fallback은 commit 이후에만 folder를 삭제하도록 유지한다.
+4. 관련 테스트와 문서를 갱신한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -162,13 +157,12 @@ Image DB 삭제 또는 소유자 삭제 transaction
 
 다음 Codex는 새 구현을 시작하기 전에 아래를 먼저 수행해야 한다.
 
-1. `git status --short`로 현재 미커밋 파일을 확인한다.
-2. `git diff -- ProfileImageServiceImpl.java ProfileImageServiceImplTest.java`로 채팅방 수정 변경을 검토한다.
-3. `./gradlew test --tests 'core.global.entity.image.*'`와 `git diff --check`를 실행한다.
-4. 사용자에게 채팅방 수정 구현 상태와 생성·삭제 후속 범위를 짧게 보고한다.
-5. 현재 변경을 커밋할지 사용자 요청을 확인한 후 다음 흐름을 구현한다.
+1. `git status --short`와 `git log -1 --oneline`으로 현재 상태를 확인한다.
+2. `deleteChatRoomProfileImage()`와 `ChatRoomService.deleteRoomIfEmpty()`의 transaction 경계를 확인한다.
+3. 구현 전 채팅방 folder 삭제 Outbox 적용 범위를 짧게 보고한다.
+4. 구현 후 이미지 대상 테스트와 `git diff --check`를 실행한다.
 
-새 구현의 첫 대상은 채팅방 프로필 이미지 **생성**이다. 생성 완료 후 삭제로 진행한다.
+새 구현의 첫 대상은 채팅방 프로필 이미지 **삭제**다.
 
 ## 수정하면 안 되는 부분
 
@@ -207,3 +201,4 @@ Image DB 삭제 또는 소유자 삭제 transaction
 - Outbox 즉시 발행은 지연 개선 목적으로 추가할 수 있지만, polling relay는 유실 복구 fallback으로 유지해야 한다.
 - 다중 서버 Outbox claim은 현재 단일 서버이므로 보류했다. 향후 같은 DB를 공유하는 다중 인스턴스가 생기면 다시 설계해야 한다.
 - `COPY_STAGING_TO_FINAL`의 완전 비동기 retry는 `REGISTER_IMAGE_DB` 없이 단독 구현하면 안 된다.
+- `uploadUserProfileImage(MultipartFile)`는 직접 `putObject` 후 DB 저장하는 별도 흐름이며 아직 compensation이 적용되지 않았다.
