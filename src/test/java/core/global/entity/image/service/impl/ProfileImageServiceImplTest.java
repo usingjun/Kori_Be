@@ -18,11 +18,15 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+import software.amazon.awssdk.http.SdkHttpResponse;
 
 import java.util.List;
 import java.util.Optional;
@@ -40,6 +44,7 @@ class ProfileImageServiceImplTest {
     private static final String SOURCE_KEY = "temp/user/profile.jpg";
     private static final String TARGET_KEY = "users/10/profile.fixed.jpg";
     private static final String OLD_KEY = "users/10/profile.old.jpg";
+    private static final String DIRECT_TARGET_KEY = "users/10/profile.direct.jpg";
     private static final Long CHAT_ROOM_ID = 20L;
     private static final String CHAT_SOURCE_KEY = "temp/chat/profile.jpg";
     private static final String CHAT_TARGET_KEY = "chatRoom/20/chat_profile.fixed.jpg";
@@ -298,6 +303,124 @@ class ProfileImageServiceImplTest {
 
             verify(storageClient).deleteFolder("users/10/");
             verify(imageOperationRecoveryService, never()).scheduleDeleteFolder(any(), any(), anyString());
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
+    @DisplayName("직접 업로드로 프로필 교체 성공 시 기존 object만 cleanup Outbox로 예약한다")
+    void uploadUserProfileImage_replacesExistingImageAndSchedulesOldCleanup() {
+        MockMultipartFile file = directProfileFile();
+        prepareDirectUpload(Optional.of(existingImage));
+        prepareDirectPutSuccess();
+
+        profileImageService.uploadUserProfileImage(USER_ID, file);
+
+        assertThat(existingImage.getUrl()).isEqualTo(CDN_BASE_URL + "/" + DIRECT_TARGET_KEY);
+        verify(imageOperationStepService).markCompleted(stepId, "\"direct-etag\"");
+        verify(imageRepository).flush();
+        verify(imageOperationRecoveryService).scheduleDeleteObjects(
+                operationId,
+                ImageOperationOwnerType.USER,
+                USER_ID,
+                List.of(OLD_KEY)
+        );
+        verify(imageOperationRecoveryService, never()).scheduleDeleteFolder(any(), any(), anyString());
+    }
+
+    @Test
+    @DisplayName("직접 업로드 실패 시 새 key 보상 삭제를 예약하고 DB를 변경하지 않는다")
+    void uploadUserProfileImage_createsCompensationWhenPutFails() {
+        MockMultipartFile file = directProfileFile();
+        prepareDirectUpload(Optional.of(existingImage));
+        doThrow(new IllegalStateException("put timeout"))
+                .when(s3Client).putObject(any(software.amazon.awssdk.services.s3.model.PutObjectRequest.class), any(RequestBody.class));
+
+        assertThatThrownBy(() -> profileImageService.uploadUserProfileImage(USER_ID, file))
+                .isInstanceOf(BusinessException.class);
+
+        assertThat(existingImage.getUrl()).isEqualTo(CDN_BASE_URL + "/" + OLD_KEY);
+        verify(imageOperationStepService).markTerminalFailed(stepId, "put timeout");
+        verify(imageOperationService).markFailed(operationId);
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, DIRECT_TARGET_KEY);
+        verify(imageRepository, never()).flush();
+    }
+
+    @Test
+    @DisplayName("직접 업로드 성공 후 DB flush 실패 시 새 key 보상 삭제를 예약한다")
+    void uploadUserProfileImage_createsCompensationWhenDbFails() {
+        MockMultipartFile file = directProfileFile();
+        prepareDirectUpload(Optional.empty());
+        prepareDirectPutSuccess();
+        when(imageRepository.save(any(Image.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        doThrow(new DataAccessResourceFailureException("db down")).when(imageRepository).flush();
+
+        assertThatThrownBy(() -> profileImageService.uploadUserProfileImage(USER_ID, file))
+                .isInstanceOf(DataAccessResourceFailureException.class);
+
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, DIRECT_TARGET_KEY);
+        verify(imageOperationRecoveryService, never()).scheduleDeleteObjects(any(), any(), any(), anyList());
+    }
+
+    @Test
+    @DisplayName("RabbitMQ 비활성화 상태에서 직접 업로드 DB 실패 시 새 object를 직접 보상 삭제한다")
+    void uploadUserProfileImage_directlyCompensatesWhenRabbitDisabled() {
+        MockMultipartFile file = directProfileFile();
+        prepareDirectUpload(Optional.empty());
+        prepareDirectPutSuccess();
+        ReflectionTestUtils.setField(profileImageService, "imageOperationRabbitEnabled", false);
+        when(imageRepository.save(any(Image.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        doThrow(new DataAccessResourceFailureException("db down")).when(imageRepository).flush();
+
+        assertThatThrownBy(() -> profileImageService.uploadUserProfileImage(USER_ID, file))
+                .isInstanceOf(DataAccessResourceFailureException.class);
+
+        verify(imageOperationService).markFailed(operationId);
+        verify(storageClient).deleteObjectsBulk(List.of(DIRECT_TARGET_KEY));
+        verify(imageOperationService).markCompensated(operationId);
+        verify(imageOperationRecoveryService, never()).scheduleCompensation(any(), anyString());
+    }
+
+    @Test
+    @DisplayName("직접 업로드 transaction rollback 시 새 key 보상 삭제를 예약한다")
+    void uploadUserProfileImage_createsCompensationWhenTransactionRollsBack() {
+        MockMultipartFile file = directProfileFile();
+        prepareDirectUpload(Optional.empty());
+        prepareDirectPutSuccess();
+        when(imageRepository.save(any(Image.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            profileImageService.uploadUserProfileImage(USER_ID, file);
+
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(synchronization ->
+                            synchronization.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK));
+
+            verify(imageOperationRecoveryService).scheduleCompensation(operationId, DIRECT_TARGET_KEY);
+            verify(imageOperationService, never()).markCompleted(operationId);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
+    @DisplayName("신규 직접 업로드 성공 시 transaction commit 후 operation을 완료한다")
+    void uploadUserProfileImage_completesOperationAfterCommit() {
+        MockMultipartFile file = directProfileFile();
+        prepareDirectUpload(Optional.empty());
+        prepareDirectPutSuccess();
+        when(imageRepository.save(any(Image.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            profileImageService.uploadUserProfileImage(USER_ID, file);
+
+            verify(imageOperationService, never()).markCompleted(operationId);
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(TransactionSynchronization::afterCommit);
+
+            verify(imageOperationService).markCompleted(operationId);
+            verify(imageOperationRecoveryService, never()).scheduleDeleteObjects(any(), any(), any(), anyList());
         } finally {
             TransactionSynchronizationManager.clearSynchronization();
         }
@@ -571,6 +694,31 @@ class ProfileImageServiceImplTest {
 
     private void prepareUserSaveSuccess() {
         when(imageRepository.save(any(Image.class))).thenAnswer(invocation -> invocation.getArgument(0));
+    }
+
+    private void prepareDirectUpload(Optional<Image> existing) {
+        when(imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, USER_ID))
+                .thenReturn(existing);
+        when(imageOperationService.createUploadOperation(
+                eq(ImageOperationType.UPLOAD_USER_PROFILE_IMAGE),
+                eq(ImageOperationOwnerType.USER),
+                eq(USER_ID),
+                anyString()
+        )).thenReturn(new ImageOperationService.UploadOperationPlan(operationId, stepId, DIRECT_TARGET_KEY));
+    }
+
+    private void prepareDirectPutSuccess() {
+        PutObjectResponse response = mock(PutObjectResponse.class);
+        when(response.sdkHttpResponse()).thenReturn(SdkHttpResponse.builder().statusCode(200).build());
+        when(response.eTag()).thenReturn("\"direct-etag\"");
+        when(s3Client.putObject(
+                any(software.amazon.awssdk.services.s3.model.PutObjectRequest.class),
+                any(RequestBody.class)
+        )).thenReturn(response);
+    }
+
+    private MockMultipartFile directProfileFile() {
+        return new MockMultipartFile("profile", "profile.jpg", "image/jpeg", new byte[]{1, 2, 3});
     }
 
     private Image prepareChatRoomStagingUpdate() {

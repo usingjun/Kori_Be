@@ -53,6 +53,8 @@
 - 사용자 프로필 삭제의 `DELETE_FOLDER + Outbox` 적용
 - 채팅방 프로필 생성 성공 후 staging cleanup Outbox 적용
 - 채팅방 프로필 삭제의 `DELETE_FOLDER + Outbox` 적용
+- 사용자 프로필 직접 MultipartFile 업로드의 operation 추적과 보상 삭제 적용
+- AI 사용자 프로필 교체의 folder 선삭제 제거
 
 ### 현재 완료 상태
 
@@ -71,6 +73,13 @@ Image row 삭제 + DELETE_FOLDER step + Outbox 저장
 채팅방 삭제:
 Image row 삭제 + DELETE_FOLDER step + Outbox 저장
 → commit 후 Consumer가 chatRoom/{chatRoomId}/ folder 삭제
+
+직접 MultipartFile 업로드:
+UPLOAD_OBJECT step 생성
+→ putObject 동기 실행 및 성공 응답 확인
+→ Image DB upsert
+→ 성공 시 기존 object DELETE_OBJECT Outbox
+→ 실패/rollback 시 새 object compensation
 ```
 
 실패 시 의미:
@@ -81,9 +90,11 @@ Image row 삭제 + DELETE_FOLDER step + Outbox 저장
 - DB 성공: staging object 삭제를 공통 Outbox/Consumer가 처리한다.
 - 사용자 삭제 transaction rollback: DB 삭제와 folder cleanup Outbox가 함께 rollback된다.
 - 채팅방 삭제 transaction rollback: DB 삭제와 folder cleanup Outbox가 함께 rollback된다.
+- 직접 업로드 실패 또는 transaction rollback: 새 object compensation을 예약한다.
+- RabbitMQ 비활성화 시 compensation은 직접 bulk delete로 실행하고 실패 기록은 기존 `FailedImageCleanup`이 담당한다.
 
 `ProfileImageServiceImplTest`, `ImageOperationRecoveryServiceTest`, 이미지 관련 대상 테스트를 통과했다.
-`./scripts/agent-check.sh`는 156개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했으며, 이번 이미지 변경으로 확인된 실패는 없다.
+`./scripts/agent-check.sh`는 164개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했으며, 이번 이미지 변경으로 확인된 실패는 없다.
 
 ### 현재 데이터/메시지 흐름
 
@@ -121,10 +132,10 @@ Domain Service
 
 ### 즉시 이어갈 작업
 
-1. `uploadUserProfileImage(MultipartFile)` 직접 `putObject` 흐름과 호출 transaction을 확인한다.
-2. `putObject` 성공 후 DB 저장 실패 시 final object compensation 방식을 설계한다.
-3. 직접 업로드 성공 후 moderation event와 operation 완료 경계를 확인한다.
-4. 구현 전 기존 API와 admin AI user 업로드 호출에 미치는 영향을 정리한다.
+1. `ImageOperationOutboxRelay`의 polling 발행 지연과 현재 transaction commit 이후 호출 지점을 확인한다.
+2. commit 직후 즉시 발행 시도와 polling fallback을 함께 유지하는 방식을 설계한다.
+3. 즉시 발행 실패가 domain transaction 결과를 변경하지 않도록 경계를 확인한다.
+4. broker 장애 시 polling relay가 pending Outbox를 재발행하는 테스트를 추가한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -152,11 +163,11 @@ staging Copy
 다음 Codex는 새 구현을 시작하기 전에 아래를 먼저 수행해야 한다.
 
 1. `git status --short`와 `git log -1 --oneline`으로 현재 상태를 확인한다.
-2. `uploadUserProfileImage(MultipartFile)`와 호출 서비스의 transaction 경계를 확인한다.
-3. 직접 업로드 보상 정책을 구현 전에 짧게 보고한다.
+2. `ImageOperationOutboxRelay`와 Outbox 저장 호출 지점을 확인한다.
+3. commit 직후 즉시 발행과 polling fallback의 경계를 구현 전에 짧게 보고한다.
 4. 구현 후 이미지 대상 테스트와 `git diff --check`를 실행한다.
 
-새 구현의 첫 대상은 `uploadUserProfileImage(MultipartFile)` 직접 업로드 보상 처리다.
+새 구현의 첫 대상은 Outbox 발행 지연 개선이다.
 
 ## 수정하면 안 되는 부분
 
@@ -195,4 +206,5 @@ staging Copy
 - Outbox 즉시 발행은 지연 개선 목적으로 추가할 수 있지만, polling relay는 유실 복구 fallback으로 유지해야 한다.
 - 다중 서버 Outbox claim은 현재 단일 서버이므로 보류했다. 향후 같은 DB를 공유하는 다중 인스턴스가 생기면 다시 설계해야 한다.
 - `COPY_STAGING_TO_FINAL`의 완전 비동기 retry는 `REGISTER_IMAGE_DB` 없이 단독 구현하면 안 된다.
-- `uploadUserProfileImage(MultipartFile)`는 직접 `putObject` 후 DB 저장하는 별도 흐름이며 아직 compensation이 적용되지 않았다.
+- 직접 업로드는 compensation이 적용됐지만 moderation event 발행 여부는 기존 동작을 유지하고 있으며 별도 확장 대상이다.
+- 직접 업로드 중 서버 종료로 `UPLOAD_OBJECT`가 `PROCESSING`에 남는 경우 bytes를 재구성할 수 없어 자동 업로드 재시도는 불가능하다. 안전한 timeout 복구 정책은 별도 설계가 필요하다.

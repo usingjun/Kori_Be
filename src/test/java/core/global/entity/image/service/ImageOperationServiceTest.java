@@ -60,6 +60,31 @@ class ImageOperationServiceTest {
     }
 
     @Test
+    @DisplayName("직접 업로드 operation 생성 시 UPLOAD_OBJECT step과 고정 targetKey를 저장한다")
+    void createUploadOperation_savesOperationAndUploadStep() {
+        when(operationRepository.save(any(ImageOperation.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.save(any(ImageOperationStep.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        ImageOperationService.UploadOperationPlan plan = operationService.createUploadOperation(
+                ImageOperationType.UPLOAD_USER_PROFILE_IMAGE,
+                ImageOperationOwnerType.USER,
+                10L,
+                "users/10/profile.direct.jpg"
+        );
+
+        ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        verify(stepRepository).save(stepCaptor.capture());
+        assertThat(plan.operationId()).isNotNull();
+        assertThat(plan.stepId()).isNotNull();
+        assertThat(plan.targetKey()).isEqualTo("users/10/profile.direct.jpg");
+        assertThat(stepCaptor.getValue().getStepType())
+                .isEqualTo(core.global.enums.common.ImageOperationStepType.UPLOAD_OBJECT);
+        assertThat(stepCaptor.getValue().getTargetKey()).isEqualTo(plan.targetKey());
+    }
+
+    @Test
     @DisplayName("재시도 대기 중인 operation은 다시 PROCESSING으로 진입할 수 있다")
     void operation_canRestartAfterRetryWaiting() {
         ImageOperation operation = ImageOperation.create(

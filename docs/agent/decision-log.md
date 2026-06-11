@@ -188,7 +188,7 @@ operation 완료 여부는 관련 step 전체 상태로 판정해야 한다. 보
 
 ### 결정
 
-최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자·채팅방 프로필 생성·수정·삭제까지 진행했으며, 직접 MultipartFile 업로드와 Post/Poll은 후속 단계다.
+최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자·채팅방 프로필 생성·수정·삭제와 사용자 프로필 직접 MultipartFile 업로드까지 진행했으며, Post/Poll은 후속 단계다.
 
 ### 이유
 
@@ -274,3 +274,48 @@ operation 완료 여부는 관련 step 전체 상태로 판정해야 한다. 보
 - folder 삭제 범위는 기존 `users/{userId}/`, `chatRoom/{chatRoomId}/` 규칙을 유지해야 한다.
 - 소유자 삭제 transaction에서 호출되더라도 Outbox가 같은 transaction에 참여해야 한다.
 - 채팅방 삭제는 `ChatRoomService.leaveRoom()`의 상위 transaction에 참여하므로 실제 folder 삭제를 commit 전에 실행하면 안 된다.
+
+## 14. 직접 MultipartFile 업로드 실패는 DB 등록 재시도 대신 object 보상 삭제로 복구한다
+
+### 결정
+
+- 직접 `putObject`는 동기 실행하고 `UPLOAD_USER_PROFILE_IMAGE / UPLOAD_OBJECT`로 상태를 추적한다.
+- `putObject` 결과 불명확, DB 반영 실패, 상위 transaction rollback 시 새 object를 `COMPENSATE_FINAL_OBJECT`로 삭제한다.
+- 실패한 요청의 Image DB 등록을 나중에 단독 재시도하지 않는다.
+
+### 이유
+
+DB 등록만 나중에 재시도하면 원래 AI User 생성/수정 transaction이 rollback됐거나 사용자가 더 최신 이미지를 설정한 상태에서 오래된 이미지가 다시 연결될 수 있다. 실패한 요청의 새 object를 제거하는 방식이 현재 동기 API에서는 더 안전하다.
+
+### 채택하지 않은 대안
+
+- `putObject` 성공 후 DB 저장만 비동기 재시도
+- 직접 업로드 전체를 RabbitMQ message로 전달
+
+### 변경 시 주의
+
+- MultipartFile bytes를 Outbox나 RabbitMQ message에 저장하지 않는다.
+- DB 등록 재시도가 필요해지면 owner 존재 여부, 최신 요청 여부, Image row 멱등성, moderation event를 포함한 전체 파이프라인으로 설계해야 한다.
+- RabbitMQ 비활성화 시 compensation Outbox를 기다리지 않고 직접 bulk delete를 실행하며, 삭제 실패는 기존 `FailedImageCleanup` fallback에 맡긴다.
+- 직접 업로드 중 서버가 종료되면 bytes를 재구성할 수 없으므로 `UPLOAD_OBJECT`를 자동 재시도해서는 안 된다.
+
+## 15. AI 사용자 프로필 교체 시 folder를 선삭제하지 않는다
+
+### 결정
+
+- `UserAdminService.updateAiUser()`는 기존 프로필 folder를 삭제한 뒤 업로드하지 않는다.
+- 새 versioned key 업로드와 DB 반영이 성공한 후 기존 object 하나만 Outbox로 삭제한다.
+
+### 이유
+
+기존 `DELETE_FOLDER` Outbox가 commit 후 실행되면 같은 `users/{userId}/` folder에 새로 업로드된 이미지까지 삭제할 수 있다. object 단위 cleanup으로 교체해야 새 이미지가 보호된다.
+
+### 채택하지 않은 대안
+
+- 기존 folder 삭제 완료 후 새 이미지 업로드
+- 새 이미지를 별도 임시 folder에 업로드한 후 이동
+
+### 변경 시 주의
+
+- 사용자 탈퇴나 명시적인 전체 프로필 삭제에서는 기존 `DELETE_FOLDER`를 유지한다.
+- 프로필 교체에서는 `DELETE_OBJECT`만 사용해야 한다.

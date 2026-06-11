@@ -33,6 +33,7 @@ import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.MetadataDirective;
 import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 
 import java.util.Collections;
 import java.util.List;
@@ -390,35 +391,55 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
 
-        if (imageRepository.existsByImageTypeAndRelatedId(ImageType.USER, userId)) {
-            throw new BusinessException(ImageErrorCode.USER_IMAGES_ALREADY_EXIST);
-        }
-
         String originalFilename = file.getOriginalFilename();
         String ext = StringUtils.getFilenameExtension(originalFilename);
         if (ext == null) ext = "jpg";
 
         String uuid = UUID.randomUUID().toString().replace("-", "");
-
         String key = "users/%d/profile.%s.%s".formatted(userId, uuid, ext);
+        Optional<Image> existingOpt =
+                imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId);
+        String oldKey = existingOpt
+                .map(Image::getUrl)
+                .filter(url -> !storageClient.isDefaultUrlOrKey(url))
+                .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
+                .orElse(null);
 
+        ImageOperationService.UploadOperationPlan uploadPlan = imageOperationService.createUploadOperation(
+                ImageOperationType.UPLOAD_USER_PROFILE_IMAGE,
+                ImageOperationOwnerType.USER,
+                userId,
+                key
+        );
+        imageOperationService.markProcessing(uploadPlan.operationId());
+        imageOperationStepService.markProcessing(uploadPlan.stepId());
         try {
             PutObjectRequest putObjectRequest = PutObjectRequest.builder()
                     .bucket(bucket)
-                    .key(key)
+                    .key(uploadPlan.targetKey())
                     .acl(ObjectCannedACL.PUBLIC_READ)
                     .contentType(file.getContentType())
                     .cacheControl("public, max-age=31536000, immutable")
                     .build();
 
-            s3Client.putObject(putObjectRequest, RequestBody.fromBytes(file.getBytes()));
-
+            PutObjectResponse response = s3Client.putObject(putObjectRequest, RequestBody.fromBytes(file.getBytes()));
+            imageOperationStepService.markCompleted(uploadPlan.stepId(), validatePutObjectResponse(response));
         } catch (Exception e) {
+            imageOperationStepService.markTerminalFailed(uploadPlan.stepId(), e.getMessage());
+            imageOperationService.markFailed(uploadPlan.operationId());
+            createCompensation(uploadPlan.operationId(), uploadPlan.targetKey());
             log.error("Profile Image Direct Upload Failed userId={}", userId, e);
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
 
-        saveImageInDB(userId, ImageType.USER, key);
+        try {
+            upsertProfileImageEntityAndFlush(userId, ImageType.USER, existingOpt, uploadPlan.targetKey());
+        } catch (RuntimeException e) {
+            createCompensation(uploadPlan.operationId(), uploadPlan.targetKey());
+            throw e;
+        }
+
+        scheduleDirectUploadCleanupAndRollbackCompensation(userId, oldKey, uploadPlan);
     }
 
 
@@ -574,7 +595,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         }
 
         if (!imageOperationRabbitEnabled) {
-            scheduleDirectCleanupFallback(cleanupKeys, copyPlan);
+            scheduleDirectCleanupFallback(cleanupKeys, copyPlan == null ? null : copyPlan.operationId());
             return;
         }
 
@@ -588,7 +609,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
 
     private void scheduleDirectCleanupFallback(
             List<String> cleanupKeys,
-            ImageOperationService.CopyOperationPlan copyPlan
+            UUID operationId
     ) {
         Runnable cleanup = () -> {
             try {
@@ -596,12 +617,12 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             } catch (RuntimeException e) {
                 log.error("[UPI] direct cleanup fallback failed keys={}", cleanupKeys, e);
             }
-            if (copyPlan != null) {
+            if (operationId != null) {
                 try {
-                    imageOperationService.markCompleted(copyPlan.operationId());
+                    imageOperationService.markCompleted(operationId);
                 } catch (RuntimeException e) {
                     log.error("[UPI] operation completion record failed operationId={}",
-                            copyPlan.operationId(), e);
+                            operationId, e);
                 }
             }
         };
@@ -677,15 +698,90 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         });
     }
 
+    private void scheduleDirectUploadCleanupAndRollbackCompensation(
+            Long userId,
+            String oldKey,
+            ImageOperationService.UploadOperationPlan uploadPlan
+    ) {
+        List<String> cleanupKeys = oldKey == null ? List.of() : List.of(oldKey);
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                        createCompensation(uploadPlan.operationId(), uploadPlan.targetKey());
+                    }
+                }
+            });
+        }
+
+        if (!imageOperationRabbitEnabled) {
+            scheduleDirectCleanupFallback(cleanupKeys, uploadPlan.operationId());
+            return;
+        }
+
+        if (!cleanupKeys.isEmpty()) {
+            imageOperationRecoveryService.scheduleDeleteObjects(
+                    uploadPlan.operationId(),
+                    ImageOperationOwnerType.USER,
+                    userId,
+                    cleanupKeys
+            );
+            return;
+        }
+
+        markOperationCompletedAfterCommit(uploadPlan.operationId());
+    }
+
+    private void markOperationCompletedAfterCommit(UUID operationId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            imageOperationService.markCompleted(operationId);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                imageOperationService.markCompleted(operationId);
+            }
+        });
+    }
+
+    private String validatePutObjectResponse(PutObjectResponse response) {
+        if (response == null
+                || response.sdkHttpResponse() == null
+                || !response.sdkHttpResponse().isSuccessful()
+                || response.eTag() == null
+                || response.eTag().isBlank()) {
+            throw new IllegalStateException("Object Storage put response did not confirm success");
+        }
+        return response.eTag();
+    }
+
     private void createCompensation(
             ImageOperationService.CopyOperationPlan copyPlan,
             String finalKey
     ) {
+        createCompensation(copyPlan.operationId(), finalKey);
+    }
+
+    private void createCompensation(UUID operationId, String finalKey) {
+        if (!imageOperationRabbitEnabled) {
+            try {
+                imageOperationService.markFailed(operationId);
+                storageClient.deleteObjectsBulk(List.of(finalKey));
+                imageOperationService.markCompensated(operationId);
+            } catch (RuntimeException compensationError) {
+                log.error("[UPI] direct compensation failed operationId={} targetKey={}",
+                        operationId, finalKey, compensationError);
+            }
+            return;
+        }
+
         try {
-            imageOperationRecoveryService.scheduleCompensation(copyPlan.operationId(), finalKey);
+            imageOperationRecoveryService.scheduleCompensation(operationId, finalKey);
         } catch (RuntimeException compensationError) {
             log.error("[UPI] compensation record failed operationId={} targetKey={}",
-                    copyPlan.operationId(), finalKey, compensationError);
+                    operationId, finalKey, compensationError);
         }
     }
 

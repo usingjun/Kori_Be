@@ -109,6 +109,27 @@ public class ImageOperationStep {
         return step;
     }
 
+    public static ImageOperationStep createUploadStep(
+            UUID operationId,
+            String targetKey,
+            int maxAttempts
+    ) {
+        requirePositiveAttempts(maxAttempts);
+        LocalDateTime now = LocalDateTime.now();
+        ImageOperationStep step = new ImageOperationStep();
+        step.stepId = UUID.randomUUID();
+        step.operationId = Objects.requireNonNull(operationId);
+        step.stepType = ImageOperationStepType.UPLOAD_OBJECT;
+        step.status = ImageOperationStepStatus.PENDING;
+        step.targetKey = requireText(targetKey, "targetKey");
+        step.attemptCount = 0;
+        step.maxAttempts = maxAttempts;
+        step.version = 0L;
+        step.createdAt = now;
+        step.updatedAt = now;
+        return step;
+    }
+
     public static ImageOperationStep createCompensationStep(
             UUID operationId,
             String targetKey,

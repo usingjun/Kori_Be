@@ -4,7 +4,7 @@
 
 - 기준 브랜치: `feat/image-idempotency`
 - 마지막 완료 커밋은 `git log -1 --oneline`으로 확인한다.
-- 현재 구현 단계: 사용자·채팅방 프로필 생성·수정·삭제 안정화 완료
+- 현재 구현 단계: 사용자·채팅방 프로필 생성·수정·삭제 및 직접 MultipartFile 업로드 안정화 완료
 - 작업 전 `AGENTS.md`, `docs/agent/project-context.md`, 인수인계 문서를 확인한다.
 - 이 문서는 이미지 생성·수정·삭제 흐름을 공통 `ImageOperation` 구조로 점진 통합하는 작업의 진행 상태를 기록한다.
 
@@ -86,20 +86,29 @@ FailedImageCleanup 저장
 ### 9. 검증 완료
 
 - 이미지 관련 대상 테스트가 통과했다.
-- `./scripts/agent-check.sh`는 156개 중 18개가 실패했다.
+- `./scripts/agent-check.sh`는 164개 중 18개가 실패했다.
 - 전체 테스트 실패는 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"` 때문이다.
 - 이번 이미지 변경으로 확인된 테스트 실패는 없다.
 
+### 10. 사용자 프로필 직접 MultipartFile 업로드
+
+- `uploadUserProfileImage(MultipartFile)`의 직접 `putObject`를 `UPLOAD_USER_PROFILE_IMAGE / UPLOAD_OBJECT`로 추적한다.
+- `putObject` 성공 응답의 HTTP 성공 여부와 ETag를 확인한 뒤 DB를 반영한다.
+- `putObject` 결과 불명확, DB 실패, 상위 transaction rollback 시 새 object 보상 삭제를 예약한다.
+- 기존 이미지 교체 성공 시 기존 object 하나만 `DELETE_OBJECT + Outbox`로 삭제한다.
+- `UserAdminService.updateAiUser()`에서 기존 folder 선삭제를 제거해 새 이미지까지 삭제되는 위험을 막는다.
+- RabbitMQ 비활성화 시에는 직접 bulk delete와 기존 `FailedImageCleanup` fallback을 사용해 보상한다.
+
 ## 현재 진행 중인 작업
 
-- 없음. 다음 구현 대상은 `uploadUserProfileImage(MultipartFile)` 직접 업로드 보상 정책이다.
+- 없음. 다음 구현 대상은 Outbox 발행 지연 개선이다.
 
 ## 남은 작업
 
 ### 가까운 범위
 
-- `uploadUserProfileImage(MultipartFile)` 직접 업로드 후 DB 실패 보상 정책 설계
 - Outbox 발행 지연 개선: transaction commit 직후 즉시 발행을 시도하고 현재 polling relay는 fallback으로 유지
+- 직접 업로드 처리 중 서버 종료로 `UPLOAD_OBJECT`가 `PROCESSING`에 남는 경우의 안전한 복구 정책 검토
 
 ### 다음 확장 범위
 
@@ -119,8 +128,7 @@ FailedImageCleanup 저장
 
 ## 다음 우선순위 작업
 
-1. `uploadUserProfileImage(MultipartFile)` 직접 업로드 흐름의 보상 정책을 결정한다.
-2. Outbox 발행 지연을 줄이되 polling relay를 fallback으로 유지한다.
-3. 이후 Post/Poll의 생성·수정·삭제 흐름으로 확장한다.
+1. Outbox 발행 지연을 줄이되 polling relay를 fallback으로 유지한다.
+2. 이후 Post/Poll의 생성·수정·삭제 흐름으로 확장한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.

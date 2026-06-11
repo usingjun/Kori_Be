@@ -428,10 +428,6 @@ public class UserAdminService {
         }
 
         if (profileFile != null && !profileFile.isEmpty()) {
-            if (imageRepository.existsByImageTypeAndRelatedId(ImageType.USER, userId)) {
-                profileImageService.deleteUserProfileImage(userId);
-                imageRepository.flush();
-            }
             profileImageService.uploadUserProfileImage(userId, profileFile);
         }
 

@@ -18,6 +18,7 @@ import java.util.UUID;
 public class ImageOperationService {
 
     private static final int DEFAULT_COPY_MAX_ATTEMPTS = 5;
+    private static final int DEFAULT_UPLOAD_MAX_ATTEMPTS = 1;
 
     private final ImageOperationRepository operationRepository;
     private final ImageOperationStepRepository stepRepository;
@@ -49,6 +50,26 @@ public class ImageOperationService {
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public UploadOperationPlan createUploadOperation(
+            ImageOperationType operationType,
+            ImageOperationOwnerType ownerType,
+            Long ownerId,
+            String targetKey
+    ) {
+        ImageOperation operation = operationRepository.save(
+                ImageOperation.create(operationType, ownerType, ownerId)
+        );
+        ImageOperationStep step = stepRepository.save(
+                ImageOperationStep.createUploadStep(
+                        operation.getOperationId(),
+                        targetKey,
+                        DEFAULT_UPLOAD_MAX_ATTEMPTS
+                )
+        );
+        return new UploadOperationPlan(operation.getOperationId(), step.getStepId(), step.getTargetKey());
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void markProcessing(UUID operationId) {
         find(operationId).markProcessing();
     }
@@ -69,6 +90,11 @@ public class ImageOperationService {
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void markCompensated(UUID operationId) {
+        find(operationId).markCompensated();
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void markDlq(UUID operationId) {
         find(operationId).markDlq();
     }
@@ -78,6 +104,13 @@ public class ImageOperationService {
     }
 
     public record CopyOperationPlan(
+            UUID operationId,
+            UUID stepId,
+            String targetKey
+    ) {
+    }
+
+    public record UploadOperationPlan(
             UUID operationId,
             UUID stepId,
             String targetKey
