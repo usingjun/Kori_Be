@@ -20,6 +20,7 @@ public class ImageOperationBatchService {
     private final ImageOperationService imageOperationService;
     private final ImageOperationStepService imageOperationStepService;
     private final ImageOperationRecoveryService imageOperationRecoveryService;
+    private final ImageOperationBatchTransactionService batchTransactionService;
     private final ImageCopyExecutor imageCopyExecutor;
     private final ImageStorageClient storageClient;
 
@@ -49,6 +50,50 @@ public class ImageOperationBatchService {
             compensate(new TrackedCopy(plan.operationId(), sourceKey, plan.targetKey()));
             throw e;
         }
+    }
+
+    public List<TrackedCopy> copyAll(
+            ImageOperationType operationType,
+            ImageOperationOwnerType ownerType,
+            Long ownerId,
+            List<CopyRequest> requests
+    ) {
+        if (requests.isEmpty()) {
+            return List.of();
+        }
+
+        List<ImageOperationBatchTransactionService.CopyPlan> plans =
+                batchTransactionService.prepareCopies(operationType, ownerType, ownerId, requests);
+        List<ImageOperationBatchTransactionService.CopyResult> results = new java.util.ArrayList<>(plans.size());
+        List<TrackedCopy> completedCopies = new java.util.ArrayList<>(plans.size());
+
+        for (int index = 0; index < plans.size(); index++) {
+            ImageOperationBatchTransactionService.CopyPlan plan = plans.get(index);
+            try {
+                ImageCopyExecutor.ImageCopyResult result = imageCopyExecutor.copy(plan.sourceKey(), plan.targetKey());
+                results.add(new ImageOperationBatchTransactionService.CopyResult(plan.stepId(), result.resultETag()));
+                completedCopies.add(new TrackedCopy(plan.operationId(), plan.sourceKey(), plan.targetKey()));
+            } catch (RuntimeException e) {
+                try {
+                    batchTransactionService.recordFailure(
+                            results,
+                            plan,
+                            plans.subList(index + 1, plans.size()),
+                            e.getMessage()
+                    );
+                } catch (RuntimeException stateError) {
+                    log.error("[ImageBatch] copy failure state record failed operationId={} stepId={}",
+                            plan.operationId(), plan.stepId(), stateError);
+                }
+                List<TrackedCopy> compensationTargets = new java.util.ArrayList<>(completedCopies);
+                compensationTargets.add(new TrackedCopy(plan.operationId(), plan.sourceKey(), plan.targetKey()));
+                compensate(compensationTargets);
+                throw e;
+            }
+        }
+
+        batchTransactionService.completeCopies(results);
+        return completedCopies;
     }
 
     public void registerRollbackCompensation(List<TrackedCopy> copies) {
@@ -152,5 +197,8 @@ public class ImageOperationBatchService {
     }
 
     public record TrackedCopy(UUID operationId, String sourceKey, String targetKey) {
+    }
+
+    public record CopyRequest(String sourceKey, String targetKey) {
     }
 }

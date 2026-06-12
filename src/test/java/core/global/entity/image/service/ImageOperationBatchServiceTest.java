@@ -28,6 +28,8 @@ class ImageOperationBatchServiceTest {
     @Mock
     private ImageOperationRecoveryService imageOperationRecoveryService;
     @Mock
+    private ImageOperationBatchTransactionService batchTransactionService;
+    @Mock
     private ImageCopyExecutor imageCopyExecutor;
     @Mock
     private ImageStorageClient storageClient;
@@ -89,6 +91,116 @@ class ImageOperationBatchServiceTest {
 
         verify(imageOperationStepService).markTerminalFailed(stepId, "timeout");
         verify(imageOperationService).markFailed(operationId);
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, "posts/10/a.jpg");
+    }
+
+    @Test
+    void copyAllPreparesAndCompletesCopiesInBatch() {
+        UUID secondOperationId = UUID.randomUUID();
+        UUID secondStepId = UUID.randomUUID();
+        List<ImageOperationBatchService.CopyRequest> requests = List.of(
+                new ImageOperationBatchService.CopyRequest("temp/a.jpg", "posts/10/a.jpg"),
+                new ImageOperationBatchService.CopyRequest("temp/b.jpg", "posts/10/b.jpg")
+        );
+        List<ImageOperationBatchTransactionService.CopyPlan> plans = List.of(
+                new ImageOperationBatchTransactionService.CopyPlan(
+                        operationId, stepId, "temp/a.jpg", "posts/10/a.jpg"
+                ),
+                new ImageOperationBatchTransactionService.CopyPlan(
+                        secondOperationId, secondStepId, "temp/b.jpg", "posts/10/b.jpg"
+                )
+        );
+        when(batchTransactionService.prepareCopies(
+                ImageOperationType.CREATE_POST_IMAGES,
+                ImageOperationOwnerType.POST,
+                10L,
+                requests
+        )).thenReturn(plans);
+        when(imageCopyExecutor.copy("temp/a.jpg", "posts/10/a.jpg"))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult("posts/10/a.jpg", "etag-a"));
+        when(imageCopyExecutor.copy("temp/b.jpg", "posts/10/b.jpg"))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult("posts/10/b.jpg", "etag-b"));
+
+        batchService.copyAll(
+                ImageOperationType.CREATE_POST_IMAGES,
+                ImageOperationOwnerType.POST,
+                10L,
+                requests
+        );
+
+        verify(batchTransactionService).completeCopies(List.of(
+                new ImageOperationBatchTransactionService.CopyResult(stepId, "etag-a"),
+                new ImageOperationBatchTransactionService.CopyResult(secondStepId, "etag-b")
+        ));
+    }
+
+    @Test
+    void copyAllRecordsFailureAndCompensatesCompletedAndUncertainTargets() {
+        UUID secondOperationId = UUID.randomUUID();
+        UUID secondStepId = UUID.randomUUID();
+        List<ImageOperationBatchService.CopyRequest> requests = List.of(
+                new ImageOperationBatchService.CopyRequest("temp/a.jpg", "posts/10/a.jpg"),
+                new ImageOperationBatchService.CopyRequest("temp/b.jpg", "posts/10/b.jpg")
+        );
+        ImageOperationBatchTransactionService.CopyPlan failedPlan =
+                new ImageOperationBatchTransactionService.CopyPlan(
+                        secondOperationId, secondStepId, "temp/b.jpg", "posts/10/b.jpg"
+                );
+        when(batchTransactionService.prepareCopies(any(), any(), anyLong(), eq(requests)))
+                .thenReturn(List.of(
+                        new ImageOperationBatchTransactionService.CopyPlan(
+                                operationId, stepId, "temp/a.jpg", "posts/10/a.jpg"
+                        ),
+                        failedPlan
+                ));
+        when(imageCopyExecutor.copy("temp/a.jpg", "posts/10/a.jpg"))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult("posts/10/a.jpg", "etag-a"));
+        when(imageCopyExecutor.copy("temp/b.jpg", "posts/10/b.jpg"))
+                .thenThrow(new IllegalStateException("timeout"));
+
+        assertThatThrownBy(() -> batchService.copyAll(
+                ImageOperationType.CREATE_POST_IMAGES,
+                ImageOperationOwnerType.POST,
+                10L,
+                requests
+        )).isInstanceOf(IllegalStateException.class);
+
+        verify(batchTransactionService).recordFailure(
+                List.of(new ImageOperationBatchTransactionService.CopyResult(stepId, "etag-a")),
+                failedPlan,
+                List.of(),
+                "timeout"
+        );
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, "posts/10/a.jpg");
+        verify(imageOperationRecoveryService).scheduleCompensation(secondOperationId, "posts/10/b.jpg");
+    }
+
+    @Test
+    void copyAllCompensatesEvenWhenFailureStateCannotBeRecorded() {
+        List<ImageOperationBatchService.CopyRequest> requests = List.of(
+                new ImageOperationBatchService.CopyRequest("temp/a.jpg", "posts/10/a.jpg")
+        );
+        ImageOperationBatchTransactionService.CopyPlan failedPlan =
+                new ImageOperationBatchTransactionService.CopyPlan(
+                        operationId, stepId, "temp/a.jpg", "posts/10/a.jpg"
+                );
+        when(batchTransactionService.prepareCopies(any(), any(), anyLong(), eq(requests)))
+                .thenReturn(List.of(failedPlan));
+        when(imageCopyExecutor.copy("temp/a.jpg", "posts/10/a.jpg"))
+                .thenThrow(new IllegalStateException("copy timeout"));
+        doThrow(new IllegalStateException("db down"))
+                .when(batchTransactionService)
+                .recordFailure(List.of(), failedPlan, List.of(), "copy timeout");
+
+        assertThatThrownBy(() -> batchService.copyAll(
+                ImageOperationType.CREATE_POST_IMAGES,
+                ImageOperationOwnerType.POST,
+                10L,
+                requests
+        ))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("copy timeout");
+
         verify(imageOperationRecoveryService).scheduleCompensation(operationId, "posts/10/a.jpg");
     }
 

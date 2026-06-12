@@ -58,6 +58,7 @@
 - 일반 Post presigned 이미지 생성·수정의 공통 Operation/Outbox 적용
 - Poll 이미지 upsert의 공통 Operation/Outbox 적용
 - 다중 이미지 Copy의 이미지별 operation 추적과 부분 성공 compensation 적용
+- Post/Poll 다중 Copy의 operation/step 준비 및 완료 상태 batch transaction 적용
 - 다중 이미지 DB 성능 baseline 측정용 `ImageOperationDbBenchmarkTest` 추가
 - assigned UUID operation entity의 `@Version` 신규 판별 문제 수정
 
@@ -87,7 +88,7 @@ UPLOAD_OBJECT step 생성
 → 실패/rollback 시 새 object compensation
 
 일반 Post/Poll 다중 이미지:
-각 staging image Copy를 독립 operation으로 추적
+각 staging image Copy를 독립 operation으로 추적하되 준비/완료 상태는 요청 단위 batch transaction으로 저장
 → DB 저장 성공 시 staging/removed object DELETE_OBJECT Outbox
 → 일부 Copy 또는 DB 저장 실패 시 성공한 final object만 compensation
 ```
@@ -104,7 +105,7 @@ UPLOAD_OBJECT step 생성
 - RabbitMQ 비활성화 시 compensation은 직접 bulk delete로 실행하고 실패 기록은 기존 `FailedImageCleanup`이 담당한다.
 
 `ProfileImageServiceImplTest`, `ImageOperationRecoveryServiceTest`, 이미지 관련 대상 테스트를 통과했다.
-최신 `./scripts/agent-check.sh`는 179개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했고, benchmark 4개는 기본 실행에서 skip됐다. 이번 이미지 변경으로 확인된 실패는 없다.
+최신 `./scripts/agent-check.sh`는 184개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했고, 4개는 skip됐다. 이번 이미지 변경으로 확인된 실패는 없다.
 
 ### 현재 데이터/메시지 흐름
 
@@ -129,6 +130,8 @@ Domain Service
 | --- | --- |
 | `ImageOperationService` | operation 생성과 상위 상태 관리 |
 | `ImageOperationStepService` | Copy step 상태 관리 |
+| `ImageOperationBatchService` | Post/Poll staging Copy 실행, 부분 실패 compensation, cleanup 연결 |
+| `ImageOperationBatchTransactionService` | Post/Poll 다중 Copy의 operation/step 준비, 성공 결과, 실패 상태를 batch transaction으로 저장 |
 | `ImageOperationRecoveryService` | compensation/delete/failure retry/DLQ/timeout 복구 orchestration |
 | `ImageOperationOutboxService` | 발행할 Outbox 조회 및 발행 결과 기록 |
 | `ImageOperationOutboxRelay` | pending Outbox를 주기적으로 RabbitMQ에 전달 |
@@ -142,10 +145,9 @@ Domain Service
 
 ### 즉시 이어갈 작업
 
-1. 서버를 재시작해 중첩 `imageExecutor` 제거 코드를 반영한다.
+1. Post/Poll의 바깥 `@Transactional`과 NCP Copy orchestration 경계를 분리한다.
 2. 새 staging manifest로 동일 `100 VU post-only`를 재실행한다.
-3. 이미지별 `REQUIRES_NEW` transaction을 요청 단위 batch 저장으로 축소하는 경계를 설계한다.
-4. 요청 단위 `ImageOperation` 1개와 이미지별 step 구조로 변경할 때 compensation/retry/DLQ 의미를 확인한다.
+3. 요청 단위 `ImageOperation` 1개와 이미지별 step 구조로 변경할 때 추가 이득과 compensation/retry/DLQ 의미를 확인한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -224,4 +226,5 @@ staging Copy
 - `100 VU post-only`에서 Hikari pool 10개는 18% 성공, pool 25개는 96% 성공했지만 비동기 operation 정체가 남았다. pool 확대만으로 해결하지 않는다.
 - 목표 서버는 2코어·8GB이므로 executor와 DB pool을 크게 설정하는 방식보다 제한된 동시성과 batch transaction을 우선한다.
 - Post/Poll 내부 Copy의 동일 `imageExecutor` 재제출과 `join()`은 제거됐다. 바깥 `@Async`는 유지하며 내부 Copy는 순차 실행한다.
-- 중첩 제거 후 DB benchmark 수치는 이미지 5장 기준 56 statements, 26 transactions로 동일하므로 DB transaction 축소는 아직 미구현이다.
+- batch 상태 저장 적용 후 DB benchmark는 이미지 5장 기준 `32 statements / 8 transactions`, 20장 기준 `122 statements / 23 transactions`로 감소했다.
+- 현재 Post/Poll 바깥 `@Transactional`은 NCP Copy 동안 유지된다. batch transaction은 이미지별 상태 갱신 증폭을 줄였지만 Copy 대기 중 외부 transaction의 connection 점유까지 제거하지는 않았다.

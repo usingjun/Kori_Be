@@ -43,6 +43,7 @@ import static org.mockito.Mockito.when;
         ImageOperationStepService.class,
         ImageOperationRecoveryService.class,
         ImageOperationBatchService.class,
+        ImageOperationBatchTransactionService.class,
         QuerydslConfig.class
 })
 class ImageOperationDbBenchmarkTest {

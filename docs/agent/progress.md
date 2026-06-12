@@ -86,7 +86,7 @@ FailedImageCleanup 저장
 ### 9. 검증 완료
 
 - 이미지 관련 대상 테스트가 통과했다.
-- 최신 `./scripts/agent-check.sh`는 179개 중 18개가 실패했고, benchmark 4개는 기본 실행에서 skip됐다.
+- 최신 `./scripts/agent-check.sh`는 184개 중 18개가 실패했고, 4개는 skip됐다.
 - 전체 테스트 실패는 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"` 때문이다.
 - 이번 이미지 변경으로 확인된 테스트 실패는 없다.
 
@@ -146,17 +146,28 @@ FailedImageCleanup 저장
 - 중첩 executor 제거 후 DB benchmark는 이미지 5장 기준 56 statements, 26 transactions로 기존과 동일했다. 이번 변경은 executor 정체 제거이며 DB 접근량 개선은 다음 단계다.
 - 실제 PostgreSQL 검증 중 assigned UUID entity의 `@Version` 수동 초기화가 신규 저장을 방해하는 문제를 발견해 제거했다.
 
+### 13. Post/Poll Copy 상태 저장 Batch 처리
+
+- 이미지별 `ImageOperation`과 `COPY_STAGING_TO_FINAL` step 추적 의미는 유지했다.
+- `ImageOperationBatchTransactionService`가 한 요청의 operation/step 준비 상태를 한 transaction에서 `saveAll`한다.
+- NCP Copy는 한 비동기 worker에서 순차 실행하고, 전체 성공 결과는 한 transaction에서 step 완료 상태로 반영한다.
+- 중간 Copy 실패 시 이전 성공 step, 실패 step, 미실행 step 상태를 한 transaction에서 정리한다.
+- Copy 실패 상태 기록 DB transaction이 실패해도, 성공했거나 성공 여부가 불명확한 destination object의 compensation은 계속 예약한다.
+- 변경 후 `PostImageServiceDbBenchmarkTest`에서 이미지 5장은 `56 statements / 26 transactions`에서 `32 statements / 8 transactions`로 감소했다.
+- 이미지 20장은 `221 statements / 101 transactions`에서 `122 statements / 23 transactions`로 감소했다.
+- 바깥 Post/Poll `@Transactional`은 아직 NCP Copy 동안 유지되므로 DB connection 장기 점유 위험은 남아 있다.
+
 ## 현재 진행 중인 작업
 
-- 동일 `imageExecutor` 중첩 제거를 완료했다.
-- 다음 작업은 서버 재시작 후 동일 `100 VU post-only` 재측정과 DB connection/transaction 증폭 축소다.
+- Post/Poll 이미지별 상태 갱신을 요청 단위 batch transaction으로 축소했다.
+- 다음 작업은 Post/Poll의 바깥 transaction과 NCP Copy 경계를 분리해 Copy 대기 중 DB connection 점유를 제거하는 것이다.
 
 ## 남은 작업
 
 ### 가까운 범위
 
-- Post/Poll 이미지 작업의 동일 `imageExecutor` 중첩 사용 제거
-- 이미지별 `REQUIRES_NEW` 상태 갱신을 요청 단위 batch transaction으로 축소
+- 동일 조건의 `100 VU post-only` 재측정
+- Post/Poll 바깥 transaction과 NCP Copy orchestration 경계 분리
 - 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조 검토
 - 2코어·8GB 환경을 고려한 제한된 Consumer/Copy 동시성 설계
 - 현재 polling 기반 Outbox 처리 지연 측정
@@ -182,10 +193,9 @@ FailedImageCleanup 저장
 
 ## 다음 우선순위 작업
 
-1. 서버를 재시작하고 동일 `100 VU post-only` 테스트로 중첩 executor 제거 효과를 측정한다.
-2. 이미지 Copy orchestration과 Image DB 저장 transaction 경계를 분리해 바깥 transaction의 connection 장기 점유를 제거한다.
-3. 이미지별 operation 생성과 `REQUIRES_NEW` 상태 갱신을 요청 단위 operation 및 batch 저장으로 축소한다.
-4. 개선 전후 DB benchmark와 `100 VU post-only` 테스트를 동일 조건으로 비교한다.
-5. 2코어·8GB 서버 기준 Consumer/Copy 동시성 및 Hikari pool 크기를 측정 결과로 결정한다.
+1. 이미지 Copy orchestration과 Image DB 저장 transaction 경계를 분리해 바깥 transaction의 connection 장기 점유를 제거한다.
+2. 서버를 재시작하고 동일 `100 VU post-only` 테스트로 중첩 executor 제거와 batch transaction 효과를 함께 측정한다.
+3. 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조의 추가 축소 효과를 검토한다.
+4. 2코어·8GB 서버 기준 Consumer/Copy 동시성 및 Hikari pool 크기를 측정 결과로 결정한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.

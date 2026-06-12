@@ -409,3 +409,28 @@ Spring Data JPA는 assigned ID entity에서 nullable `@Version`을 신규 여부
 
 - 내부 병렬 Copy를 다시 도입하려면 바깥 orchestration executor와 분리된 제한된 executor 또는 RabbitMQ Consumer 동시성을 사용해야 한다.
 - 중첩 제거 효과와 DB 병목을 구분하기 위해 동일 `100 VU post-only` 테스트를 먼저 재실행한다.
+
+## 19. Post/Poll 이미지별 추적은 유지하고 상태 저장 transaction을 batch 처리한다
+
+### 결정
+
+- 이미지별 `ImageOperation`과 `COPY_STAGING_TO_FINAL` step은 유지한다.
+- 한 요청의 operation/step 준비 상태와 Copy 완료 결과는 각각 요청 단위 `REQUIRES_NEW` transaction에서 batch 저장한다.
+- NCP Copy는 batch DB transaction 밖에서 순차 실행한다.
+- Copy 실패 시 이전 성공, 현재 실패, 이후 미실행 step 상태를 한 transaction에서 정리한다.
+
+### 이유
+
+이미지별 독립 추적과 compensation 대상을 유지하면서도 이미지마다 반복되던 operation 생성, PROCESSING, COMPLETED transaction을 줄이기 위해서다. `PostImageServiceDbBenchmarkTest`에서 5장 기준 transaction이 `26 → 8`, 20장 기준 `101 → 23`으로 감소했다.
+
+### 채택하지 않은 대안
+
+- 안정성 추적을 제거하고 Image row만 저장
+- Post/Poll 요청 전체를 하나의 step으로 축약
+- Hikari pool 크기만 확대
+
+### 변경 시 주의
+
+- Copy 실패 상태 기록이 실패해도 destination object compensation은 실행해야 한다.
+- 미실행 Copy destination은 compensation하지 않는다.
+- 현재 바깥 Post/Poll `@Transactional`은 Copy 동안 유지되므로 DB connection 장기 점유 문제는 별도 개선해야 한다.

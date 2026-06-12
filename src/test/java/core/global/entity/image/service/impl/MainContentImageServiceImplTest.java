@@ -52,8 +52,8 @@ class MainContentImageServiceImplTest {
 
     @Test
     void upsertPollImagesTracksCopyAndSchedulesCleanup() {
-        when(imageOperationBatchService.copy(any(), any(), eq(20L), eq("temp/a.jpg"), eq("vote/20/000_a.jpg")))
-                .thenReturn(trackedCopy);
+        when(imageOperationBatchService.copyAll(any(), any(), eq(20L), anyList()))
+                .thenReturn(List.of(trackedCopy));
         when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
 
         imageService.upsertPollImages(20L, List.of("temp/a.jpg"), List.of(), PollType.VOTE);
@@ -68,8 +68,8 @@ class MainContentImageServiceImplTest {
 
     @Test
     void upsertPollImagesCompensatesWhenDbFlushFails() {
-        when(imageOperationBatchService.copy(any(), any(), eq(20L), anyString(), anyString()))
-                .thenReturn(trackedCopy);
+        when(imageOperationBatchService.copyAll(any(), any(), eq(20L), anyList()))
+                .thenReturn(List.of(trackedCopy));
         when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
         doThrow(new DataAccessResourceFailureException("db down")).when(imageRepository).flush();
 

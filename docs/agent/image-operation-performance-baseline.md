@@ -433,6 +433,32 @@ prepared statement와 transaction 수는 변경 전과 동일하다. 이번 변�
 
 기존 Copy 동시성 `5/10/20` benchmark는 제거된 내부 병렬 Copy 구조를 측정한 역사적 결과다. 현재 구조의 개선 효과는 서버 재시작 후 `100 VU post-only`로 다시 측정해야 한다.
 
+### operation/step 상태 저장 Batch 적용 후 DB benchmark
+
+Post/Poll의 이미지별 operation 추적은 유지하면서 한 요청의 operation/step 준비 상태와 Copy 완료 상태를 각각 batch transaction으로 저장하도록 변경했다.
+
+2026-06-12 `PostImageServiceDbBenchmarkTest` 결과:
+
+| 이미지 수 | 실행시간 | Prepared statements | Hibernate transactions |
+| ---: | ---: | ---: | ---: |
+| 1 | 120ms | 8 | 4 |
+| 5 | 27ms | 32 | 8 |
+| 10 | 37ms | 62 | 13 |
+| 20 | 62ms | 122 | 23 |
+
+변경 전과 비교:
+
+| 이미지 수 | Prepared statements | Hibernate transactions |
+| ---: | ---: | ---: |
+| 1 | `12 → 8` | `6 → 4` |
+| 5 | `56 → 32` | `26 → 8` |
+| 10 | `111 → 62` | `51 → 13` |
+| 20 | `221 → 122` | `101 → 23` |
+
+transaction 증가식은 `5 × 이미지 수 + 1`에서 대략 `이미지 수 + 3`으로 줄었다. 남아 있는 이미지 수 비례 transaction은 성공 후 staging cleanup step/Outbox 저장 경로의 영향이 크다.
+
+이번 변경은 이미지별 상태 갱신 transaction 증폭을 줄였지만, Post/Poll 서비스 바깥 `@Transactional`은 여전히 NCP Copy 동안 유지된다. 따라서 Copy 대기 중 DB connection 장기 점유를 제거하려면 Copy orchestration과 Image DB 저장 transaction 경계를 추가로 분리해야 한다.
+
 ### 개선 판단 기준
 
 - 실제 API 응답시간이 요구사항을 만족하면 현재 구조를 유지하고 관찰한다.

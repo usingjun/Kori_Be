@@ -61,8 +61,8 @@ class PostImageServiceImplTest {
     @Test
     void savePostImagesTracksCopyAndSchedulesStagingCleanup() {
         when(imageRepository.existsByImageTypeAndRelatedId(any(), eq(10L))).thenReturn(false);
-        when(imageOperationBatchService.copy(any(), any(), eq(10L), eq("temp/a.jpg"), eq("posts/10/000_a.jpg")))
-                .thenReturn(trackedCopy);
+        when(imageOperationBatchService.copyAll(any(), any(), eq(10L), anyList()))
+                .thenReturn(List.of(trackedCopy));
         when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
 
         postImageService.savePostImages(10L, List.of("temp/a.jpg"));
@@ -95,8 +95,8 @@ class PostImageServiceImplTest {
     @Test
     void savePostImagesCompensatesWhenDbFlushFails() {
         when(imageRepository.existsByImageTypeAndRelatedId(any(), eq(10L))).thenReturn(false);
-        when(imageOperationBatchService.copy(any(), any(), eq(10L), anyString(), anyString()))
-                .thenReturn(trackedCopy);
+        when(imageOperationBatchService.copyAll(any(), any(), eq(10L), anyList()))
+                .thenReturn(List.of(trackedCopy));
         when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
         doThrow(new DataAccessResourceFailureException("db down")).when(imageRepository).flush();
 
@@ -111,15 +111,12 @@ class PostImageServiceImplTest {
     void savePostImagesCompensatesSuccessfulCopiesWhenAnotherCopyFails() {
         lenient().when(storageClient.isStagingKey("temp/b.jpg")).thenReturn(true);
         when(imageRepository.existsByImageTypeAndRelatedId(any(), eq(10L))).thenReturn(false);
-        when(imageOperationBatchService.copy(any(), any(), eq(10L), eq("temp/a.jpg"), eq("posts/10/000_a.jpg")))
-                .thenReturn(trackedCopy);
-        when(imageOperationBatchService.copy(any(), any(), eq(10L), eq("temp/b.jpg"), eq("posts/10/001_b.jpg")))
+        when(imageOperationBatchService.copyAll(any(), any(), eq(10L), anyList()))
                 .thenThrow(new IllegalStateException("copy failed"));
 
         assertThatThrownBy(() -> postImageService.savePostImages(10L, List.of("temp/a.jpg", "temp/b.jpg")))
                 .isInstanceOf(core.global.exception.BusinessException.class);
 
-        verify(imageOperationBatchService).compensate(List.of(trackedCopy));
         verify(imageRepository, never()).saveAll(anyList());
     }
 

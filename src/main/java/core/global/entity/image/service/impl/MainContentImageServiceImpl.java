@@ -114,6 +114,7 @@ public class MainContentImageServiceImpl implements MainContentImageService {
     ) {
         List<ImageOperationBatchService.TrackedCopy> trackedCopies = new ArrayList<>();
         List<Image> toSave = new ArrayList<>(adds.size());
+        List<PendingCopy> pendingCopies = new ArrayList<>();
 
         try {
             for (int i = 0; i < adds.size(); i++) {
@@ -129,15 +130,37 @@ public class MainContentImageServiceImpl implements MainContentImageService {
                     continue;
                 }
 
-                String finalKey = ensureFinalKey(postId, basePrefix, myOrder, srcKey, trackedCopies);
+                String finalKey = finalKey(basePrefix, myOrder, srcKey);
                 String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, finalKey);
-                if (!survivorUrls.contains(finalUrl)) {
+                if (storageClient.isStagingKey(srcKey) && !srcKey.equals(finalKey)) {
+                    pendingCopies.add(new PendingCopy(srcKey, finalKey, finalUrl, myOrder));
+                } else if (!survivorUrls.contains(finalUrl)) {
                     toSave.add(Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null));
+                }
+            }
+
+            trackedCopies.addAll(imageOperationBatchService.copyAll(
+                    ImageOperationType.UPDATE_POLL_IMAGES,
+                    ImageOperationOwnerType.POLL,
+                    postId,
+                    pendingCopies.stream()
+                            .map(copy -> new ImageOperationBatchService.CopyRequest(copy.sourceKey(), copy.targetKey()))
+                            .toList()
+            ));
+            for (PendingCopy pendingCopy : pendingCopies) {
+                if (!survivorUrls.contains(pendingCopy.finalUrl())) {
+                    toSave.add(Image.of(
+                            ImageType.POST,
+                            postId,
+                            pendingCopy.finalUrl(),
+                            pendingCopy.order(),
+                            ImageModerationStatus.CLEAN,
+                            null
+                    ));
                 }
             }
             return new CopyResult(toSave, trackedCopies);
         } catch (Exception e) {
-            imageOperationBatchService.compensate(trackedCopies);
             log.error("[Vote IMG] Sequential copy failed", e);
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
@@ -185,29 +208,12 @@ public class MainContentImageServiceImpl implements MainContentImageService {
         return k.startsWith("default/"); // 예: default/character_03.png
     }
 
-    private String ensureFinalKey(
-            Long pollId,
-            String basePrefix,
-            int order,
-            String srcKey,
-            List<ImageOperationBatchService.TrackedCopy> trackedCopies
-    ) {
+    private String finalKey(String basePrefix, int order, String srcKey) {
         String base = basePrefix.endsWith("/") ? basePrefix.substring(0, basePrefix.length() - 1) : basePrefix;
         if (!storageClient.isStagingKey(srcKey)) return srcKey;
 
         String basename = srcKey.substring(srcKey.lastIndexOf('/') + 1);
-        String dstKey = "%s/%03d_%s".formatted(base, order, basename);
-        if (srcKey.equals(dstKey)) return srcKey;
-
-        ImageOperationBatchService.TrackedCopy trackedCopy = imageOperationBatchService.copy(
-                ImageOperationType.UPDATE_POLL_IMAGES,
-                ImageOperationOwnerType.POLL,
-                pollId,
-                srcKey,
-                dstKey
-        );
-        trackedCopies.add(trackedCopy);
-        return trackedCopy.targetKey();
+        return "%s/%03d_%s".formatted(base, order, basename);
     }
 
     private record SurvivorContext(
@@ -221,5 +227,8 @@ public class MainContentImageServiceImpl implements MainContentImageService {
             List<Image> toSave,
             List<ImageOperationBatchService.TrackedCopy> trackedCopies
     ) {
+    }
+
+    private record PendingCopy(String sourceKey, String targetKey, String finalUrl, int order) {
     }
 }

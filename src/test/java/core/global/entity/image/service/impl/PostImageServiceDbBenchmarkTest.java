@@ -6,6 +6,7 @@ import core.global.entity.image.repository.ImageOperationConsumedMessageReposito
 import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageCopyExecutor;
 import core.global.entity.image.service.ImageOperationBatchService;
+import core.global.entity.image.service.ImageOperationBatchTransactionService;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.entity.image.service.ImageOperationService;
 import core.global.entity.image.service.ImageOperationStepService;
@@ -56,6 +57,7 @@ import static org.mockito.Mockito.when;
         ImageOperationStepService.class,
         ImageOperationRecoveryService.class,
         ImageOperationBatchService.class,
+        ImageOperationBatchTransactionService.class,
         QuerydslConfig.class
 })
 class PostImageServiceDbBenchmarkTest {
