@@ -297,6 +297,7 @@ class ImageOperationRecoveryServiceTest {
         when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
                 List.of(
                         ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
                         ImageOperationStepType.DELETE_OBJECT,
                         ImageOperationStepType.DELETE_FOLDER
                 ),
@@ -328,6 +329,7 @@ class ImageOperationRecoveryServiceTest {
         when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
                 List.of(
                         ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
                         ImageOperationStepType.DELETE_OBJECT,
                         ImageOperationStepType.DELETE_FOLDER
                 ),
@@ -359,6 +361,7 @@ class ImageOperationRecoveryServiceTest {
         when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
                 List.of(
                         ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
                         ImageOperationStepType.DELETE_OBJECT,
                         ImageOperationStepType.DELETE_FOLDER
                 ),
@@ -388,6 +391,7 @@ class ImageOperationRecoveryServiceTest {
         when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
                 List.of(
                         ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
                         ImageOperationStepType.DELETE_OBJECT,
                         ImageOperationStepType.DELETE_FOLDER
                 ),
@@ -404,6 +408,69 @@ class ImageOperationRecoveryServiceTest {
         assertThat(exhaustedStep.getStatus()).isEqualTo(ImageOperationStepStatus.DLQ);
         assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.DLQ);
         assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.DLQ);
+    }
+
+    @Test
+    @DisplayName("오래된 PROCESSING Copy step을 retry Outbox로 복구한다")
+    void recoverTimedOutPipelineSteps_schedulesCopyRetry() {
+        ImageOperationStep copyStep = ImageOperationStep.createCopyStep(
+                operation.getOperationId(),
+                "temp/a.jpg",
+                "posts/10/000_a.jpg",
+                null,
+                null,
+                5
+        );
+        copyStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(ImageOperationStepType.COPY_STAGING_TO_FINAL, ImageOperationStepType.REGISTER_IMAGE_DB),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(copyStep));
+
+        int recovered = recoveryService.recoverTimedOutPipelineSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(recovered).isEqualTo(1);
+        assertThat(copyStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(captor.getValue().getStepType()).isEqualTo(ImageOperationStepType.COPY_STAGING_TO_FINAL);
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.RETRY);
+    }
+
+    @Test
+    @DisplayName("Copy timeout 재시도 한도 소진 시 DLQ와 보상 삭제를 함께 예약한다")
+    void recoverTimedOutPipelineSteps_schedulesCompensationWhenExhausted() {
+        ImageOperationStep copyStep = ImageOperationStep.createCopyStep(
+                operation.getOperationId(),
+                "temp/a.jpg",
+                "posts/10/000_a.jpg",
+                null,
+                null,
+                1
+        );
+        copyStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(ImageOperationStepType.COPY_STAGING_TO_FINAL, ImageOperationStepType.REGISTER_IMAGE_DB),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(copyStep));
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+        when(stepRepository.findByOperationIdAndStepTypeAndTargetKey(
+                operation.getOperationId(),
+                ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                copyStep.getTargetKey()
+        )).thenReturn(Optional.empty());
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        recoveryService.recoverTimedOutPipelineSteps(timedOutBefore);
+
+        assertThat(copyStep.getStatus()).isEqualTo(ImageOperationStepStatus.DLQ);
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.DLQ);
+        verify(outboxRepository, times(2)).save(any());
     }
 
     @Test

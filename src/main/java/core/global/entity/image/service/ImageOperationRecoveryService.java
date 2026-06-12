@@ -9,6 +9,7 @@ import core.global.entity.image.repository.ImageOperationRepository;
 import core.global.entity.image.repository.ImageOperationStepRepository;
 import core.global.enums.common.ImageOperationMessageDestination;
 import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageOperationStatus;
 import core.global.enums.common.ImageCleanupOperationType;
 import core.global.enums.common.ImageOperationStepStatus;
 import core.global.enums.common.ImageOperationStepType;
@@ -32,8 +33,13 @@ public class ImageOperationRecoveryService {
     private static final int DEFAULT_CLEANUP_MAX_ATTEMPTS = 5;
     private static final List<ImageOperationStepType> RECOVERABLE_DELETE_STEP_TYPES = List.of(
             ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+            ImageOperationStepType.DELETE_STAGING,
             ImageOperationStepType.DELETE_OBJECT,
             ImageOperationStepType.DELETE_FOLDER
+    );
+    private static final List<ImageOperationStepType> RECOVERABLE_PIPELINE_STEP_TYPES = List.of(
+            ImageOperationStepType.COPY_STAGING_TO_FINAL,
+            ImageOperationStepType.REGISTER_IMAGE_DB
     );
 
     private final ImageOperationRepository operationRepository;
@@ -60,7 +66,9 @@ public class ImageOperationRecoveryService {
                 )
         );
         outboxRepository.save(outbox(step, 0, ImageOperationMessageDestination.INITIAL));
-        operation.markFailed();
+        if (operation.getStatus() != ImageOperationStatus.DLQ) {
+            operation.markFailed();
+        }
     }
 
     @Transactional
@@ -257,6 +265,30 @@ public class ImageOperationRecoveryService {
         return timedOutSteps.size();
     }
 
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public int recoverTimedOutPipelineSteps(LocalDateTime timedOutBefore) {
+        List<ImageOperationStep> timedOutSteps =
+                stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                        RECOVERABLE_PIPELINE_STEP_TYPES,
+                        ImageOperationStepStatus.PROCESSING,
+                        timedOutBefore
+                );
+
+        for (ImageOperationStep step : timedOutSteps) {
+            boolean exhausted = step.markFailed("Image pipeline step processing timeout");
+            ImageOperationMessageDestination destination = exhausted
+                    ? ImageOperationMessageDestination.DLQ
+                    : ImageOperationMessageDestination.RETRY;
+            outboxRepository.save(outbox(step, step.getAttemptCount(), destination));
+            if (exhausted) {
+                ImageOperation operation = operationRepository.findById(step.getOperationId()).orElseThrow();
+                operation.markDlq();
+                createCompensationIfMissing(operation, step.getTargetKey());
+            }
+        }
+        return timedOutSteps.size();
+    }
+
     private ImageOperationStep findMatchingStep(ImageOperationMessageView message) {
         ImageOperationStep step = stepRepository.findById(message.stepId()).orElseThrow();
         if (!step.getOperationId().equals(message.operationId())
@@ -293,6 +325,24 @@ public class ImageOperationRecoveryService {
                 attempt,
                 destination
         );
+    }
+
+    private void createCompensationIfMissing(ImageOperation operation, String targetKey) {
+        if (stepRepository.findByOperationIdAndStepTypeAndTargetKey(
+                operation.getOperationId(),
+                ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                targetKey
+        ).isPresent()) {
+            return;
+        }
+        ImageOperationStep compensationStep = stepRepository.save(
+                ImageOperationStep.createCompensationStep(
+                        operation.getOperationId(),
+                        targetKey,
+                        DEFAULT_COMPENSATION_MAX_ATTEMPTS
+                )
+        );
+        outboxRepository.save(outbox(compensationStep, 0, ImageOperationMessageDestination.INITIAL));
     }
 
     public record ImageOperationMessageView(

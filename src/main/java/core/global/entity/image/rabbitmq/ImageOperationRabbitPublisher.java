@@ -44,6 +44,9 @@ public class ImageOperationRabbitPublisher {
     private String initialRoutingKey(ImageOperationStepType stepType) {
         return switch (stepType) {
             case COMPENSATE_FINAL_OBJECT -> COMPENSATE_ROUTING_KEY;
+            case COPY_STAGING_TO_FINAL -> COPY_ROUTING_KEY;
+            case REGISTER_IMAGE_DB -> REGISTER_IMAGE_DB_ROUTING_KEY;
+            case DELETE_STAGING -> DELETE_STAGING_ROUTING_KEY;
             case DELETE_OBJECT -> ImageOperationRabbitNames.DELETE_OBJECT_ROUTING_KEY;
             case DELETE_FOLDER -> ImageOperationRabbitNames.DELETE_FOLDER_ROUTING_KEY;
             default -> throw new IllegalArgumentException("Unsupported initial image operation step type " + stepType);

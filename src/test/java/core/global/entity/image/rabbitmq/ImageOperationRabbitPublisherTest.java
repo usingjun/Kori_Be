@@ -16,6 +16,7 @@ import java.util.UUID;
 import static core.global.entity.image.rabbitmq.ImageCleanupRabbitNames.RETRY_EXCHANGE;
 import static core.global.entity.image.rabbitmq.ImageCleanupRabbitNames.EXCHANGE;
 import static core.global.entity.image.rabbitmq.ImageOperationRabbitNames.DELETE_OBJECT_ROUTING_KEY;
+import static core.global.entity.image.rabbitmq.ImageOperationRabbitNames.COPY_ROUTING_KEY;
 import static core.global.entity.image.rabbitmq.ImageOperationRabbitNames.STEP_RETRY_PREFIX;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
@@ -108,5 +109,27 @@ class ImageOperationRabbitPublisherTest {
                 eq(ImageOperationRabbitNames.DELETE_FOLDER_ROUTING_KEY),
                 any(ImageOperationMessage.class)
         );
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishWithConfirm_routesInitialCopyStep() {
+        ImageOperationPublishOutbox outbox = ImageOperationPublishOutbox.create(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                ImageOperationStepType.COPY_STAGING_TO_FINAL,
+                "posts/1/000_a.jpg",
+                0,
+                ImageOperationMessageDestination.INITIAL
+        );
+        when(rabbitTemplate.invoke(any(RabbitOperations.OperationsCallback.class)))
+                .thenAnswer(invocation -> {
+                    RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
+                    return callback.doInRabbit(rabbitOperations);
+                });
+
+        publisher.publishWithConfirm(outbox);
+
+        verify(rabbitOperations).convertAndSend(eq(EXCHANGE), eq(COPY_ROUTING_KEY), any(ImageOperationMessage.class));
     }
 }

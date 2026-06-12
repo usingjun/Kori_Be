@@ -33,5 +33,9 @@ class ImageOperationTimeoutRecoverySchedulerTest {
                 !actual.isBefore(expected.minusSeconds(1))
                         && !actual.isAfter(expected.plusSeconds(1))
         ));
+        verify(recoveryService).recoverTimedOutPipelineSteps(argThat(actual ->
+                !actual.isBefore(expected.minusSeconds(1))
+                        && !actual.isAfter(expected.plusSeconds(1))
+        ));
     }
 }

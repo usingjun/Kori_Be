@@ -152,9 +152,35 @@ public class ImageOperationStep {
         return createDeleteStep(operationId, ImageOperationStepType.DELETE_FOLDER, targetKey, maxAttempts);
     }
 
+    public static ImageOperationStep createRegisterImageDbStep(
+            UUID operationId,
+            String targetKey,
+            int maxAttempts
+    ) {
+        return createStep(operationId, ImageOperationStepType.REGISTER_IMAGE_DB, null, targetKey, maxAttempts);
+    }
+
+    public static ImageOperationStep createDeleteStagingStep(
+            UUID operationId,
+            String targetKey,
+            int maxAttempts
+    ) {
+        return createDeleteStep(operationId, ImageOperationStepType.DELETE_STAGING, targetKey, maxAttempts);
+    }
+
     private static ImageOperationStep createDeleteStep(
             UUID operationId,
             ImageOperationStepType stepType,
+            String targetKey,
+            int maxAttempts
+    ) {
+        return createStep(operationId, stepType, null, targetKey, maxAttempts);
+    }
+
+    private static ImageOperationStep createStep(
+            UUID operationId,
+            ImageOperationStepType stepType,
+            String sourceKey,
             String targetKey,
             int maxAttempts
     ) {
@@ -165,6 +191,7 @@ public class ImageOperationStep {
         step.operationId = Objects.requireNonNull(operationId);
         step.stepType = stepType;
         step.status = ImageOperationStepStatus.PENDING;
+        step.sourceKey = sourceKey;
         step.targetKey = requireText(targetKey, "targetKey");
         step.attemptCount = 0;
         step.maxAttempts = maxAttempts;

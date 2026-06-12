@@ -533,3 +533,49 @@ NCP Copy는 외부 I/O이므로 실행시간 동안 DB connection을 점유할 �
 - `afterCommit()`은 실행 시점만 보장하며 durable queue가 아니다.
 - DB commit 직후 callback 실행 전 서버가 종료되면 이미지 작업 요청이 유실될 수 있다.
 - 완전한 전달 보장이 필요하면 Post/Poll transaction 안에서 작업 요청 Outbox를 저장하고 Consumer가 처리하는 구조가 필요하다.
+
+## 22. Post 생성 이미지는 전체 단계 재시도 파이프라인으로 처리한다
+
+### 결정
+
+- RabbitMQ 활성화 시 Post 생성 transaction 안에서 최초 이미지 step과 Outbox를 저장한다.
+- staging 이미지는 `COPY_STAGING_TO_FINAL → REGISTER_IMAGE_DB → DELETE_STAGING` 순서로 처리한다.
+- Copy만 단독 재시도하지 않고, DB 등록과 staging 삭제까지 이어지는 단계형 파이프라인으로 처리한다.
+- 각 단계 완료와 다음 단계 Outbox 저장은 같은 transaction으로 묶는다.
+- 외부 NCP Copy는 transaction 밖에서 실행한다.
+
+### 이유
+
+기존 구조는 Post API 성공 후 비동기 Copy 또는 Image DB 등록이 실패하면 사용자가 이미지를 다시 등록해야 했다. 또한 `afterCommit` 메모리 callback과 executor queue는 서버 종료 시 작업 요청이 유실될 수 있었다.
+
+전체 단계 재시도를 적용하면 일시적인 Copy 장애, DB 등록 장애, staging 삭제 장애를 각각 해당 단계부터 복구할 수 있다. Post 저장과 최초 Outbox가 함께 commit되므로 Post만 생성되고 이미지 작업 요청이 사라지는 문제도 줄어든다.
+
+### 채택하지 않은 대안
+
+- Copy 실패 시 final object 보상 삭제만 수행하고 사용자가 다시 등록
+- Copy step만 자동 재시도하고 Image DB 등록은 재시도하지 않음
+- 전체 Copy와 DB 등록을 하나의 긴 transaction에서 실행
+
+### 변경 시 주의
+
+- 현재 적용 범위는 Post 생성뿐이다. Post 수정은 제거 이미지, 순서 변경, 최신 요청 덮어쓰기 방지를 함께 설계해야 한다.
+- 동일 message 재전달 시 Image DB 중복 등록을 방지해야 한다.
+- Copy/Register retry 한도 소진 시 생성됐을 수 있는 final object의 보상 삭제가 필요하다.
+- RabbitMQ 비활성화 시 기존 직접 처리 fallback을 유지한다.
+
+## 23. 전체 재시도 설계는 특정 저사양 서버 제약을 기준으로 축소하지 않는다
+
+### 결정
+
+- 전체 재시도 파이프라인은 일반적인 안정적 서비스 환경을 기준으로 설계한다.
+- 기존 `postImageExecutor` worker 10개는 직접 처리 fallback의 부하 테스트 시작값으로만 유지한다.
+- 현재 단계에서 다중 서버, MSA, 자동 증설 구조는 설계 범위에 포함하지 않는다.
+
+### 이유
+
+이번 작업의 핵심은 특정 서버 사양에 맞춘 처리량 제한이 아니라, 작업 유실 방지, 단계별 재시도, 멱등성, 짧은 transaction 경계다. 특정 저사양 환경을 전제로 설계를 축소하면 안정성 요구사항을 충분히 충족하지 못할 수 있다.
+
+### 변경 시 주의
+
+- 동시성을 무제한으로 설정한다는 의미는 아니다.
+- 실제 Consumer 동시성 값은 운영 환경 측정으로 결정하되, 현재 worker 10개를 아키텍처의 고정 한도로 가정하지 않는다.

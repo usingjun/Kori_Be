@@ -153,9 +153,9 @@ Domain Service
 
 ### 즉시 이어갈 작업
 
-1. 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 안전한 timeout 복구 정책을 구현한다.
-2. Post/Poll 전체 비동기 작업 요청을 durable Outbox로 저장할지 설계한다.
-3. 2코어·8GB 실제 서버에서 `postImageExecutor` 동시성 10을 재검증한다.
+1. 실제 RabbitMQ/NCP 환경에서 Post 생성 전체 재시도 흐름을 검증한다.
+2. Copy, `REGISTER_IMAGE_DB`, `DELETE_STAGING` 각각의 retry/DLQ와 서버 재시작 복구를 확인한다.
+3. Post 수정 전체 재시도 payload와 최신 요청 보호 규칙을 설계한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -187,7 +187,7 @@ staging Copy
 3. 기존에 남은 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 안전한 복구 경계를 확인한다.
 4. timeout 복구 시 Copy만 재시도하지 말고 target object compensation과 상태 종결을 보장한다.
 
-최종 재측정에서 API 요청과 실제 이미지 반영은 모두 성공했다. 다음 작업의 첫 대상은 과거 테스트에서 남은 오래된 `PROCESSING` 상태를 안전하게 종결하는 timeout 복구다.
+Post 생성 전체 재시도 파이프라인 구현과 이미지 회귀 테스트를 완료했다. 다음 작업의 첫 대상은 실제 RabbitMQ/NCP 환경 검증이며, 검증 후 Post 수정과 Poll로 확장한다.
 
 ## 수정하면 안 되는 부분
 
@@ -244,20 +244,24 @@ staging Copy
 - 현재 Poll 이미지는 `ImageType.POST`를 공유한다. 이는 기존 동작을 유지한 것이며 별도 type으로 분리한 것이 아니다.
 - 개선 전 다중 이미지 구조는 이미지 1장당 prepared statement 10개, Hibernate transaction 5개가 증가한다. 상세 측정 방법은 `docs/agent/image-operation-performance-baseline.md`를 확인한다.
 - `100 VU post-only`에서 Hikari pool 10개는 18% 성공, pool 25개는 96% 성공했지만 비동기 operation 정체가 남았다. pool 확대만으로 해결하지 않는다.
-- 목표 서버는 2코어·8GB이므로 executor와 DB pool을 크게 설정하는 방식보다 제한된 동시성과 batch transaction을 우선한다.
+- `postImageExecutor` worker 10개는 기존 직접 처리 fallback의 부하 테스트 시작값이며, 전체 재시도 파이프라인의 영구적인 처리량 제한으로 간주하지 않는다.
 - Post/Poll 내부 Copy의 동일 `imageExecutor` 재제출과 `join()`은 제거됐다. 바깥 `@Async`는 유지하며 내부 Copy는 순차 실행한다.
 - batch 상태 저장 적용 후 DB benchmark는 이미지 5장 기준 `32 statements / 8 transactions`, 20장 기준 `122 statements / 23 transactions`로 감소했다.
 - Post/Poll NCP Copy는 DB transaction 밖에서 실행된다. Copy 전 snapshot 조회와 Copy 후 최종 쓰기 transaction만 DB connection을 사용한다.
 - transaction 경계 분리 후 DB benchmark는 이미지 5장 `33 statements / 9 transactions`, 20장 `123 statements / 24 transactions`다. 직전보다 transaction이 1개 늘었지만 긴 Copy 구간의 connection 점유를 제거한 것이 핵심이다.
 - Copy 도중 같은 owner 이미지가 변경되면 최종 snapshot 검증이 실패하고 새 final object를 compensation한다.
 - Post/Poll 이미지 작업은 상위 transaction commit 이후에만 제출된다. rollback 시 작업을 시작하지 않는다.
-- 현재 `afterCommit` 제출은 메모리 callback이므로 commit 직후 서버 종료 시 작업 요청이 유실될 수 있다.
+- Post 수정과 Poll의 `afterCommit` 제출은 아직 메모리 callback이므로 commit 직후 서버 종료 시 작업 요청이 유실될 수 있다. RabbitMQ 활성화된 Post 생성은 최초 Outbox를 transaction 안에서 저장한다.
 - 최종 구조의 실제 NCP Copy 자체 속도는 동일 Object Storage benchmark로 아직 재측정하지 않았다.
+- RabbitMQ 활성화 시 Post 생성은 `ImageOperationPayload`와 최초 Outbox를 Post transaction 안에서 저장한다.
+- Post 생성 staging 이미지는 `COPY_STAGING_TO_FINAL → REGISTER_IMAGE_DB → DELETE_STAGING` 전체 재시도 흐름을 사용한다.
+- Copy/Register timeout은 retry queue로 복구하며, 재시도 한도 소진 시 final object 보상 삭제를 예약한다.
+- Post 수정과 Poll은 아직 기존 직접 비동기 처리 경로다.
 
 ## 다음 Task 우선순위
 
-1. 현재 미커밋 변경사항을 검토하고 커밋한다.
-2. 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 timeout 복구를 구현한다.
-3. Post/Poll `afterCommit` 메모리 callback을 durable Outbox로 전환할지 설계한다.
-4. 2코어·8GB 실제 서버에서 `postImageExecutor` worker 10개를 검증한다.
+1. 현재 미커밋 Post 생성 전체 재시도 변경사항을 검토하고 커밋한다.
+2. 실제 RabbitMQ/NCP 환경에서 전체 단계 처리와 retry/DLQ를 검증한다.
+3. Post 수정 전체 재시도 payload와 최신 요청 보호 규칙을 설계한다.
+4. Post 수정 적용 후 Poll로 확장한다.
 5. 최종 구조의 실제 NCP Copy benchmark와 Outbox 발행 지연을 측정한다.

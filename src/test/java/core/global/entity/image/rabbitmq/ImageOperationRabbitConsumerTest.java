@@ -1,8 +1,11 @@
 package core.global.entity.image.rabbitmq;
 
 import core.global.entity.image.service.ImageObjectDeleteExecutor;
+import core.global.entity.image.service.ImageCopyExecutor;
+import core.global.entity.image.service.ImageOperationPipelineExecutor;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.entity.image.service.FailedImageCleanupService;
+import core.global.entity.image.service.PostImageOperationPipelineService;
 import core.global.enums.common.ImageCleanupOperationType;
 import core.global.enums.common.ImageOperationStepType;
 import org.junit.jupiter.api.Test;
@@ -26,6 +29,10 @@ class ImageOperationRabbitConsumerTest {
     private ImageObjectDeleteExecutor objectDeleteExecutor;
     @Mock
     private FailedImageCleanupService failedImageCleanupService;
+    @Mock
+    private ImageOperationPipelineExecutor pipelineExecutor;
+    @Mock
+    private PostImageOperationPipelineService postPipelineService;
 
     @InjectMocks
     private ImageOperationRabbitConsumer consumer;
@@ -91,6 +98,30 @@ class ImageOperationRabbitConsumerTest {
         consumer.consume(message);
 
         verifyNoInteractions(objectDeleteExecutor);
+        verify(recoveryService, never()).markCompleted(any());
+    }
+
+    @Test
+    void consume_copiesAndSchedulesRegistration() {
+        ImageOperationMessage message = message(ImageOperationStepType.COPY_STAGING_TO_FINAL);
+        when(recoveryService.begin(any())).thenReturn(true);
+        when(pipelineExecutor.copy(message.stepId()))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult(message.targetKey(), "etag"));
+
+        consumer.consume(message);
+
+        verify(postPipelineService).completeCopyAndScheduleRegistration(any(), eq("etag"));
+        verify(recoveryService, never()).markCompleted(any());
+    }
+
+    @Test
+    void consume_registersImageAndSchedulesStagingDelete() {
+        ImageOperationMessage message = message(ImageOperationStepType.REGISTER_IMAGE_DB);
+        when(recoveryService.begin(any())).thenReturn(true);
+
+        consumer.consume(message);
+
+        verify(postPipelineService).registerImageAndScheduleStagingDelete(any());
         verify(recoveryService, never()).markCompleted(any());
     }
 

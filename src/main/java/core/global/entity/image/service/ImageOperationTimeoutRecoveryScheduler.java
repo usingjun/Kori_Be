@@ -23,11 +23,12 @@ public class ImageOperationTimeoutRecoveryScheduler {
 
     @Scheduled(fixedDelayString = "${image.operation.timeout-recovery-delay-ms:60000}")
     public void recoverTimedOutDeleteSteps() {
-        int recovered = recoveryService.recoverTimedOutDeleteSteps(
-                LocalDateTime.now().minus(processingTimeout)
-        );
-        if (recovered > 0) {
-            log.warn("[ImageOperationRecovery] recovered timed-out delete steps count={}", recovered);
+        LocalDateTime timedOutBefore = LocalDateTime.now().minus(processingTimeout);
+        int recoveredDeletes = recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
+        int recoveredPipelineSteps = recoveryService.recoverTimedOutPipelineSteps(timedOutBefore);
+        if (recoveredDeletes > 0 || recoveredPipelineSteps > 0) {
+            log.warn("[ImageOperationRecovery] recovered timed-out deleteSteps={} pipelineSteps={}",
+                    recoveredDeletes, recoveredPipelineSteps);
         }
     }
 }

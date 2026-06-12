@@ -176,11 +176,27 @@ FailedImageCleanup 저장
 - 예약 후 호출자가 원본 List를 변경해도 작업 내용이 바뀌지 않도록 전달 목록을 복사한다.
 - 현재 방식은 메모리 기반 `afterCommit` callback이므로 commit 직후 서버가 종료되면 이미지 작업 요청이 유실될 수 있다.
 
+### 16. Post 생성 이미지 전체 재시도 파이프라인
+
+- RabbitMQ 활성화 시 Post 생성 transaction 안에서 `ImageOperation`, `ImageOperationPayload`, 최초 step, Outbox를 함께 저장한다.
+- staging 이미지는 `COPY_STAGING_TO_FINAL → REGISTER_IMAGE_DB → DELETE_STAGING` 순서로 처리한다.
+- Copy와 Image DB 등록 실패는 기존 retry queue와 DLQ 흐름을 사용한다.
+- Copy와 DB 등록 재시도 한도를 소진하면 final object 보상 삭제를 예약한다.
+- 각 단계 완료와 다음 단계 step/Outbox 저장은 같은 짧은 transaction에서 처리한다.
+- NCP Copy는 DB transaction 밖에서 실행한다.
+- `REGISTER_IMAGE_DB`는 동일 `ImageType + relatedId + finalUrl`이 이미 존재하면 성공으로 간주한다.
+- Post가 삭제된 뒤 늦게 도착한 DB 등록 요청은 실패 처리한다.
+- Consumer 실행 중 서버 종료로 Copy 또는 DB 등록 step이 오래 `PROCESSING`에 남으면 timeout scheduler가 retry queue로 복구한다.
+- RabbitMQ 비활성화 시에는 기존 `afterCommit + postImageExecutor` 경로를 유지한다.
+- 현재 전체 재시도 적용 범위는 Post 생성이며, Post 수정과 Poll은 아직 기존 직접 비동기 경로다.
+- 이미지 전체 회귀 테스트는 통과했다.
+- 최신 `./scripts/agent-check.sh`는 205개 중 18개가 실패했고 4개는 skip됐다. 실패 원인은 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"`다.
+
 ## 현재 진행 중인 작업
 
-- Post/Poll 이미지 구조 개선과 동일 `50 VU`, `100 VU post-only` 최종 재측정을 완료했다.
-- 최종 재측정에서 API 요청, Copy step, operation, Image DB 반영이 모두 성공했다.
-- 현재 구조 개선 변경사항은 아직 커밋하지 않았다.
+- Post 생성 이미지의 전체 재시도 파이프라인 구현을 완료했다.
+- 이미지 전체 회귀 테스트가 통과했다.
+- 실제 RabbitMQ/NCP 환경의 단계별 retry/DLQ 검증과 부하 재측정은 남아 있다.
 - 현재 구현 기준 Post 수정 전체 흐름은 `docs/agent/post-image-update-sequence.md`에 기록했다.
 
 ### 최초 구조와 최종 구조 성능 비교
@@ -214,9 +230,9 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 
 ### 가까운 범위
 
-- 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 안전한 timeout 복구
-- commit 이후 비동기 제출의 메모리 callback 유실 가능성을 Outbox로 확장할지 검토
-- 2코어·8GB 실제 서버에서 `postImageExecutor` worker 10개 적정성 재검증
+- 실제 RabbitMQ 환경에서 Post 생성 `Copy → REGISTER_IMAGE_DB → DELETE_STAGING` 흐름 검증
+- Copy, DB 등록, staging 삭제 각각의 retry/DLQ 및 서버 재시작 복구 검증
+- Post 수정과 Poll에 전체 재시도 파이프라인 확장
 - 최종 구조의 실제 NCP Copy benchmark 재측정
 - 현재 polling 기반 Outbox 처리 지연 측정
 - 측정 결과에 따른 Outbox 발행 지연 개선 여부 결정
@@ -240,12 +256,11 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 
 ## 다음 우선순위 작업
 
-1. 현재 변경사항을 검토하고 커밋한다.
-2. 기존에 남은 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` 상태의 안전한 timeout 복구를 구현한다.
-3. Post/Poll 전체 비동기 작업 요청을 durable Outbox로 저장할지 설계한다.
-4. 2코어·8GB 실제 서버에서 `postImageExecutor` worker 10개를 재검증한다.
-5. 최종 구조의 실제 NCP Copy benchmark와 Outbox 발행 지연을 측정한다.
-6. 결과에 따라 제한 병렬 Copy, Outbox 즉시 발행 신호 적용 여부를 결정한다.
+1. 실제 RabbitMQ/NCP 환경에서 Post 생성 전체 재시도 흐름을 검증한다.
+2. 검증 결과를 바탕으로 Post 수정 전체 재시도 payload와 최신 요청 보호 규칙을 설계한다.
+3. Post 수정 적용 후 Poll에 같은 구조를 확장한다.
+4. 최종 구조의 실제 NCP Copy benchmark와 Outbox 발행 지연을 측정한다.
+5. 결과에 따라 Outbox 즉시 발행 신호 적용 여부를 결정한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.
 
@@ -267,6 +282,9 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 | 기존 Copy `PROCESSING` 방치 복구 | 미완료 | 기존 315개에 대한 timeout 복구 필요 |
 | Copy 제한 병렬 처리 | 검토 대기 | NCP `CopyAll` 미제공, 필요 시 동시성 5~10 검토 |
 | 전체 비동기 작업 요청 durable Outbox | 검토 대기 | 현재 `afterCommit` callback 유실 가능성 존재 |
+| Post 생성 전체 재시도 Outbox | 완료 | `COPY_STAGING_TO_FINAL → REGISTER_IMAGE_DB → DELETE_STAGING` |
+| Copy/Register timeout 복구 | 완료 | 오래된 `PROCESSING`을 retry/DLQ로 전환 |
+| Post 수정/Poll 전체 재시도 Outbox | 미완료 | 최신 요청 보호와 제거/순서 변경 payload 설계 필요 |
 
 ## 구조 개선 커밋 기준
 

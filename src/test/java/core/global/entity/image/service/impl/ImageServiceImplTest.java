@@ -1,6 +1,7 @@
 package core.global.entity.image.service.impl;
 
 import core.global.entity.image.service.ImageStorageClient;
+import core.global.entity.image.service.PostImageOperationPipelineService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.service.ProfileImageService;
 import core.global.enums.PollType;
@@ -12,6 +13,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +32,8 @@ class ImageServiceImplTest {
     private ImageStorageClient imageStorageClient;
     @Mock
     private MainContentImageService mainContentImageService;
+    @Mock
+    private PostImageOperationPipelineService postImageOperationPipelineService;
 
     @InjectMocks
     private ImageServiceImpl imageService;
@@ -79,6 +83,16 @@ class ImageServiceImplTest {
         imageService.savePostImages(10L, List.of("temp/a.jpg"));
         triggerAfterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK);
 
+        verify(postImageService, never()).savePostImages(10L, List.of("temp/a.jpg"));
+    }
+
+    @Test
+    void savePostImagesSchedulesDurablePipelineWhenRabbitIsEnabled() {
+        ReflectionTestUtils.setField(imageService, "imageOperationRabbitEnabled", true);
+
+        imageService.savePostImages(10L, List.of("temp/a.jpg"));
+
+        verify(postImageOperationPipelineService).scheduleCreate(10L, List.of("temp/a.jpg"));
         verify(postImageService, never()).savePostImages(10L, List.of("temp/a.jpg"));
     }
 

@@ -2,7 +2,9 @@ package core.global.entity.image.rabbitmq;
 
 import core.global.entity.image.service.ImageObjectDeleteExecutor;
 import core.global.entity.image.service.FailedImageCleanupService;
+import core.global.entity.image.service.ImageOperationPipelineExecutor;
 import core.global.entity.image.service.ImageOperationRecoveryService;
+import core.global.entity.image.service.PostImageOperationPipelineService;
 import core.global.enums.common.ImageOperationStepType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -19,6 +21,8 @@ public class ImageOperationRabbitConsumer {
     private final ImageOperationRecoveryService recoveryService;
     private final ImageObjectDeleteExecutor objectDeleteExecutor;
     private final FailedImageCleanupService failedImageCleanupService;
+    private final ImageOperationPipelineExecutor pipelineExecutor;
+    private final PostImageOperationPipelineService postPipelineService;
 
     @RabbitListener(queues = ImageOperationRabbitNames.STEP_QUEUE)
     public void consume(ImageOperationMessage message) {
@@ -29,7 +33,17 @@ public class ImageOperationRabbitConsumer {
 
         try {
             switch (message.stepType()) {
-                case COMPENSATE_FINAL_OBJECT, DELETE_OBJECT -> objectDeleteExecutor.deleteObject(message.targetKey());
+                case COPY_STAGING_TO_FINAL -> {
+                    var result = pipelineExecutor.copy(message.stepId());
+                    postPipelineService.completeCopyAndScheduleRegistration(view, result.resultETag());
+                    return;
+                }
+                case REGISTER_IMAGE_DB -> {
+                    postPipelineService.registerImageAndScheduleStagingDelete(view);
+                    return;
+                }
+                case COMPENSATE_FINAL_OBJECT, DELETE_STAGING, DELETE_OBJECT ->
+                        objectDeleteExecutor.deleteObject(message.targetKey());
                 case DELETE_FOLDER -> failedImageCleanupService.executeCleanup(
                         core.global.enums.common.ImageCleanupOperationType.DELETE_FOLDER,
                         message.targetKey()
@@ -42,6 +56,16 @@ public class ImageOperationRabbitConsumer {
         } catch (Exception e) {
             ImageOperationRecoveryService.FailureDecision decision =
                     recoveryService.markFailedAndSchedule(view, e.getMessage());
+            if (decision.exhausted()
+                    && (message.stepType() == ImageOperationStepType.COPY_STAGING_TO_FINAL
+                    || message.stepType() == ImageOperationStepType.REGISTER_IMAGE_DB)) {
+                try {
+                    recoveryService.scheduleCompensation(message.operationId(), message.targetKey());
+                } catch (RuntimeException compensationError) {
+                    log.error("[ImageOperationConsumer] exhausted step compensation scheduling failed operationId={} stepId={}",
+                            message.operationId(), message.stepId(), compensationError);
+                }
+            }
             log.warn("[ImageOperationConsumer] step failed operationId={} stepId={} type={} attempt={} exhausted={}",
                     message.operationId(), message.stepId(), message.stepType(),
                     decision.attempt(), decision.exhausted(), e);

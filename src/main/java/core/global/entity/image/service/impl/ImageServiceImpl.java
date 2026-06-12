@@ -6,11 +6,13 @@ import core.global.entity.image.dto.PresignedUrlRequest;
 import core.global.entity.image.dto.PresignedUrlResponse;
 import core.global.entity.image.service.ImageService;
 import core.global.entity.image.service.ImageStorageClient;
+import core.global.entity.image.service.PostImageOperationPipelineService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.service.ProfileImageService;
 import core.global.enums.PollType;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -27,6 +29,10 @@ public class ImageServiceImpl implements ImageService {
     private final ProfileImageService profileImageService;
     private final ImageStorageClient imageStorageClient;
     private final MainContentImageService mainContentImageService;
+    private final PostImageOperationPipelineService postImageOperationPipelineService;
+
+    @Value("${image.cleanup.rabbit.enabled:false}")
+    private boolean imageOperationRabbitEnabled;
 
     @Override
     public List<PresignedUrlResponse> generatePresignedUrls(PresignedUrlRequest request) {
@@ -36,6 +42,10 @@ public class ImageServiceImpl implements ImageService {
     @Override
     public void savePostImages(Long postId, List<String> toAdd) {
         List<String> adds = copyNullableList(toAdd);
+        if (imageOperationRabbitEnabled) {
+            postImageOperationPipelineService.scheduleCreate(postId, adds);
+            return;
+        }
         runAfterCommit(() -> postImageService.savePostImages(postId, adds));
     }
 

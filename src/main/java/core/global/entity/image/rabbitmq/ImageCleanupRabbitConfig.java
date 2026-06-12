@@ -131,6 +131,27 @@ public class ImageCleanupRabbitConfig {
     }
 
     @Bean
+    public Binding imageOperationCopyStepBinding() {
+        return BindingBuilder.bind(imageOperationStepQueue())
+                .to(imageOperationExchange())
+                .with(ImageOperationRabbitNames.COPY_ROUTING_KEY);
+    }
+
+    @Bean
+    public Binding imageOperationRegisterImageDbStepBinding() {
+        return BindingBuilder.bind(imageOperationStepQueue())
+                .to(imageOperationExchange())
+                .with(ImageOperationRabbitNames.REGISTER_IMAGE_DB_ROUTING_KEY);
+    }
+
+    @Bean
+    public Binding imageOperationDeleteStagingStepBinding() {
+        return BindingBuilder.bind(imageOperationStepQueue())
+                .to(imageOperationExchange())
+                .with(ImageOperationRabbitNames.DELETE_STAGING_ROUTING_KEY);
+    }
+
+    @Bean
     public Binding imageOperationDeleteObjectStepBinding() {
         return BindingBuilder.bind(imageOperationStepQueue())
                 .to(imageOperationExchange())
