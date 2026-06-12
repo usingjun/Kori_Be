@@ -86,7 +86,7 @@ FailedImageCleanup 저장
 ### 9. 검증 완료
 
 - 이미지 관련 대상 테스트가 통과했다.
-- 최신 `./scripts/agent-check.sh`는 187개 중 18개가 실패했고, 4개는 skip됐다.
+- 최신 `./scripts/agent-check.sh`는 191개 중 18개가 실패했고, 4개는 skip됐다.
 - 전체 테스트 실패는 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"` 때문이다.
 - 이번 이미지 변경으로 확인된 테스트 실패는 없다.
 
@@ -167,9 +167,18 @@ FailedImageCleanup 저장
 - 변경 후 DB benchmark는 이미지 5장 `33 statements / 9 transactions`, 20장 `123 statements / 24 transactions`다.
 - 직전 batch 구조보다 조회 transaction과 snapshot 검증 query가 각각 추가됐지만, 긴 Copy 구간을 감싸던 transaction은 제거됐다.
 
+### 15. Post/Poll 이미지 비동기 작업의 After Commit 제출
+
+- `ImageService`와 `ImageServiceImpl`의 `savePostImages()`, `updatePostImages()`, `upsertPollImages()`에서 불필요한 `@Transactional`을 제거했다.
+- 상위 Post/Poll transaction이 활성화된 경우 실제 `@Async` 이미지 작업은 `afterCommit()`에서만 제출한다.
+- 상위 transaction이 rollback되면 이미지 Copy와 DB 저장 작업을 시작하지 않는다.
+- transaction 없이 직접 호출되는 경우에는 기존처럼 즉시 비동기 작업을 제출한다.
+- 예약 후 호출자가 원본 List를 변경해도 작업 내용이 바뀌지 않도록 전달 목록을 복사한다.
+- 현재 방식은 메모리 기반 `afterCommit` callback이므로 commit 직후 서버가 종료되면 이미지 작업 요청이 유실될 수 있다.
+
 ## 현재 진행 중인 작업
 
-- Post/Poll의 NCP Copy와 Image DB 저장 transaction 경계를 분리했다.
+- Post/Poll 이미지 작업을 상위 transaction commit 이후에만 비동기 제출하도록 변경했다.
 - 다음 작업은 동일 `100 VU post-only` 테스트로 connection pool 고갈 개선 여부를 재측정하는 것이다.
 
 ## 남은 작업
@@ -178,6 +187,7 @@ FailedImageCleanup 저장
 
 - 동일 조건의 `100 VU post-only` 재측정
 - transaction 경계 분리 후 동일 조건의 `100 VU post-only` 재측정
+- commit 이후 비동기 제출의 메모리 callback 유실 가능성을 Outbox로 확장할지 검토
 - 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조 검토
 - 2코어·8GB 환경을 고려한 제한된 Consumer/Copy 동시성 설계
 - 현재 polling 기반 Outbox 처리 지연 측정
@@ -205,7 +215,8 @@ FailedImageCleanup 저장
 
 1. 서버를 재시작하고 동일 `100 VU post-only` 테스트로 중첩 executor 제거, batch 상태 저장, transaction 경계 분리 효과를 함께 측정한다.
 2. NCP Copy 전용 제한 병렬 처리 또는 `S3AsyncClient` 적용 여부를 검토한다.
-3. 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조의 추가 축소 효과를 검토한다.
-4. 2코어·8GB 서버 기준 Consumer/Copy 동시성 및 Hikari pool 크기를 측정 결과로 결정한다.
+3. Post/Poll 전체 비동기 작업 요청을 durable Outbox로 저장할지 설계한다.
+4. 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조의 추가 축소 효과를 검토한다.
+5. 2코어·8GB 서버 기준 Consumer/Copy 동시성 및 Hikari pool 크기를 측정 결과로 결정한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.

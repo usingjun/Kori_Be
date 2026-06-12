@@ -114,6 +114,27 @@ public class ImageOperationBatchService {
         copies.forEach(this::compensate);
     }
 
+    private void compensate(TrackedCopy copy) {
+        if (!imageOperationRabbitEnabled) {
+            try {
+                imageOperationService.markFailed(copy.operationId());
+                storageClient.deleteObjectsBulk(List.of(copy.targetKey()));
+                imageOperationService.markCompensated(copy.operationId());
+            } catch (RuntimeException e) {
+                log.error("[ImageBatch] direct compensation failed operationId={} targetKey={}",
+                        copy.operationId(), copy.targetKey(), e);
+            }
+            return;
+        }
+
+        try {
+            imageOperationRecoveryService.scheduleCompensation(copy.operationId(), copy.targetKey());
+        } catch (RuntimeException e) {
+            log.error("[ImageBatch] compensation record failed operationId={} targetKey={}",
+                    copy.operationId(), copy.targetKey(), e);
+        }
+    }
+
     public void scheduleCleanup(
             ImageOperationOwnerType ownerType,
             Long ownerId,
@@ -143,27 +164,6 @@ public class ImageOperationBatchService {
             );
         }
         imageOperationRecoveryService.scheduleDeleteObjects(null, ownerType, ownerId, cleanupKeys);
-    }
-
-    private void compensate(TrackedCopy copy) {
-        if (!imageOperationRabbitEnabled) {
-            try {
-                imageOperationService.markFailed(copy.operationId());
-                storageClient.deleteObjectsBulk(List.of(copy.targetKey()));
-                imageOperationService.markCompensated(copy.operationId());
-            } catch (RuntimeException e) {
-                log.error("[ImageBatch] direct compensation failed operationId={} targetKey={}",
-                        copy.operationId(), copy.targetKey(), e);
-            }
-            return;
-        }
-
-        try {
-            imageOperationRecoveryService.scheduleCompensation(copy.operationId(), copy.targetKey());
-        } catch (RuntimeException e) {
-            log.error("[ImageBatch] compensation record failed operationId={} targetKey={}",
-                    copy.operationId(), copy.targetKey(), e);
-        }
     }
 
     private void scheduleDirectCleanupAfterCommit(List<String> cleanupKeys, List<TrackedCopy> copies) {

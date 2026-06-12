@@ -60,6 +60,7 @@
 - 다중 이미지 Copy의 이미지별 operation 추적과 부분 성공 compensation 적용
 - Post/Poll 다중 Copy의 operation/step 준비 및 완료 상태 batch transaction 적용
 - Post/Poll NCP Copy와 Image DB 저장 transaction 경계 분리
+- Post/Poll 상위 transaction commit 이후 이미지 `@Async` 작업 제출
 - 다중 이미지 DB 성능 baseline 측정용 `ImageOperationDbBenchmarkTest` 추가
 - assigned UUID operation entity의 `@Version` 신규 판별 문제 수정
 
@@ -89,6 +90,8 @@ UPLOAD_OBJECT step 생성
 → 실패/rollback 시 새 object compensation
 
 일반 Post/Poll 다중 이미지:
+상위 Post/Poll transaction commit 성공
+→ `afterCommit()`에서 이미지 `@Async` 작업 제출
 각 staging image Copy를 독립 operation으로 추적하되 준비/완료 상태는 요청 단위 batch transaction으로 저장
 → NCP Copy는 DB transaction 없이 실행
 → 최종 snapshot 검증
@@ -108,7 +111,7 @@ UPLOAD_OBJECT step 생성
 - RabbitMQ 비활성화 시 compensation은 직접 bulk delete로 실행하고 실패 기록은 기존 `FailedImageCleanup`이 담당한다.
 
 `ProfileImageServiceImplTest`, `ImageOperationRecoveryServiceTest`, 이미지 관련 대상 테스트를 통과했다.
-최신 `./scripts/agent-check.sh`는 187개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했고, 4개는 skip됐다. 이번 이미지 변경으로 확인된 실패는 없다.
+최신 `./scripts/agent-check.sh`는 191개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했고, 4개는 skip됐다. 이번 이미지 변경으로 확인된 실패는 없다.
 
 ### 현재 데이터/메시지 흐름
 
@@ -136,6 +139,7 @@ Domain Service
 | `ImageOperationBatchService` | Post/Poll staging Copy 실행, 부분 실패 compensation, cleanup 연결 |
 | `ImageOperationBatchTransactionService` | Post/Poll 다중 Copy의 operation/step 준비, 성공 결과, 실패 상태를 batch transaction으로 저장 |
 | `ImagePersistenceTransactionService` | Copy 전 Image snapshot 조회와 Copy 후 DB 저장·cleanup Outbox의 짧은 transaction 관리 |
+| `ImageServiceImpl` | Post/Poll transaction commit 이후 실제 비동기 이미지 작업 제출 |
 | `ImageOperationRecoveryService` | compensation/delete/failure retry/DLQ/timeout 복구 orchestration |
 | `ImageOperationOutboxService` | 발행할 Outbox 조회 및 발행 결과 기록 |
 | `ImageOperationOutboxRelay` | pending Outbox를 주기적으로 RabbitMQ에 전달 |
@@ -151,7 +155,8 @@ Domain Service
 
 1. 새 staging manifest로 동일 `100 VU post-only`를 재실행한다.
 2. NCP Copy 전용 제한 병렬 처리 또는 `S3AsyncClient` 적용 여부를 검토한다.
-3. 요청 단위 `ImageOperation` 1개와 이미지별 step 구조로 변경할 때 추가 이득과 compensation/retry/DLQ 의미를 확인한다.
+3. 현재 메모리 기반 `afterCommit` 제출을 durable Outbox로 확장할지 결정한다.
+4. 요청 단위 `ImageOperation` 1개와 이미지별 step 구조로 변경할 때 추가 이득과 compensation/retry/DLQ 의미를 확인한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -234,3 +239,5 @@ staging Copy
 - Post/Poll NCP Copy는 DB transaction 밖에서 실행된다. Copy 전 snapshot 조회와 Copy 후 최종 쓰기 transaction만 DB connection을 사용한다.
 - transaction 경계 분리 후 DB benchmark는 이미지 5장 `33 statements / 9 transactions`, 20장 `123 statements / 24 transactions`다. 직전보다 transaction이 1개 늘었지만 긴 Copy 구간의 connection 점유를 제거한 것이 핵심이다.
 - Copy 도중 같은 owner 이미지가 변경되면 최종 snapshot 검증이 실패하고 새 final object를 compensation한다.
+- Post/Poll 이미지 작업은 상위 transaction commit 이후에만 제출된다. rollback 시 작업을 시작하지 않는다.
+- 현재 `afterCommit` 제출은 메모리 callback이므로 commit 직후 서버 종료 시 작업 요청이 유실될 수 있다.

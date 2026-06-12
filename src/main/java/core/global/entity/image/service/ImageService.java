@@ -16,13 +16,10 @@ public interface ImageService {
 
     List<PresignedUrlResponse> generatePresignedUrls(PresignedUrlRequest request);
 
-    @Transactional
     void savePostImages(Long postId, List<String> toAdd) throws BusinessException;
 
-    @Transactional
     void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove);
 
-    @Transactional
     void upsertPollImages(Long id, List<String> addImageUrls, List<String> removeImageUrls, PollType type);
 
     @Transactional

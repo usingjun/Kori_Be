@@ -460,3 +460,27 @@ NCP Copy는 외부 I/O이므로 실행시간 동안 DB connection을 점유할 �
 - transaction 수 자체는 짧은 조회 transaction 때문에 직전 구조보다 1개 증가한다. 목표는 transaction 개수 최소화가 아니라 외부 I/O 동안 connection 점유 제거다.
 - 같은 owner의 이미지 요청이 Copy 중간에 변경되면 stale snapshot 오류와 compensation이 발생할 수 있다.
 - snapshot 검증을 제거하면 동시 수정 시 이미지 순서와 제거 대상 정합성이 깨질 수 있다.
+
+## 21. Post/Poll 이미지 비동기 작업은 상위 Transaction Commit 이후 제출한다
+
+### 결정
+
+- `ImageServiceImpl`의 Post/Poll 비동기 위임 메서드에는 `@Transactional`을 두지 않는다.
+- 호출자 transaction synchronization이 활성화되어 있으면 `afterCommit()`에서 `PostImageServiceImpl` 또는 `MainContentImageServiceImpl`의 `@Async` 메서드를 호출한다.
+- 호출자 transaction이 없으면 기존처럼 즉시 호출한다.
+
+### 이유
+
+기존 구조는 Post/Poll transaction 안에서 `@Async` 작업을 즉시 제출해, 이미지 작업이 먼저 완료된 후 상위 transaction이 rollback될 수 있었다. commit 이후 제출하면 rollback된 Post/Poll에 이미지가 연결되거나 기존 이미지가 변경되는 문제를 막을 수 있다.
+
+### 채택하지 않은 대안
+
+- 상위 transaction 안에서 `@Async` 즉시 제출 유지
+- 이미지 작업 전체를 상위 transaction에서 동기 실행
+- 현재 단계에서 Post/Poll Copy·DB 등록 전체 RabbitMQ 파이프라인 구현
+
+### 변경 시 주의
+
+- `afterCommit()`은 실행 시점만 보장하며 durable queue가 아니다.
+- DB commit 직후 callback 실행 전 서버가 종료되면 이미지 작업 요청이 유실될 수 있다.
+- 완전한 전달 보장이 필요하면 Post/Poll transaction 안에서 작업 요청 Outbox를 저장하고 Consumer가 처리하는 구조가 필요하다.
