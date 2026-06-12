@@ -16,16 +16,12 @@ import core.global.exception.BusinessException;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executor;
 
 @Slf4j
 @Service
@@ -36,8 +32,6 @@ public class MainContentImageServiceImpl implements MainContentImageService {
     private final ImageStorageClient storageClient;
     private final ImageOperationBatchService imageOperationBatchService;
     private final ApplicationEventPublisher eventPublisher;
-    @Qualifier("imageExecutor")
-    private final Executor imageExecutor;
 
     @Value("${ncp.s3.bucket}")
     private String bucket;
@@ -72,7 +66,7 @@ public class MainContentImageServiceImpl implements MainContentImageService {
 
         final String basePrefix = "vote/" + id;
 
-        CopyResult copyResult = copyNewImagesInParallel(
+        CopyResult copyResult = copyNewImagesSequentially(
                 id,
                 adds,
                 basePrefix,
@@ -111,46 +105,40 @@ public class MainContentImageServiceImpl implements MainContentImageService {
         return (list == null) ? List.of() : list;
     }
 
-    private CopyResult copyNewImagesInParallel(
+    private CopyResult copyNewImagesSequentially(
             Long postId,
             List<String> adds,
             String basePrefix,
             Set<String> survivorUrls,
             int startOrder
     ) {
-        var trackedCopies = new ConcurrentLinkedQueue<ImageOperationBatchService.TrackedCopy>();
-        List<CompletableFuture<Image>> futures = new ArrayList<>();
+        List<ImageOperationBatchService.TrackedCopy> trackedCopies = new ArrayList<>();
+        List<Image> toSave = new ArrayList<>(adds.size());
 
-        for (int i = 0; i < adds.size(); i++) {
-            final int myOrder = startOrder + i;
-            final String raw = adds.get(i);
-
-            var future = CompletableFuture.supplyAsync(() -> {
+        try {
+            for (int i = 0; i < adds.size(); i++) {
+                int myOrder = startOrder + i;
+                String raw = adds.get(i);
                 String srcKey = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, raw);
 
                 if (isDefaultUrlOrKey(srcKey)) {
                     String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, srcKey);
-                    if (survivorUrls.contains(finalUrl)) return null;
-                    return Image.of(ImageType.POST, postId, finalUrl, myOrder);
+                    if (!survivorUrls.contains(finalUrl)) {
+                        toSave.add(Image.of(ImageType.POST, postId, finalUrl, myOrder));
+                    }
+                    continue;
                 }
 
                 String finalKey = ensureFinalKey(postId, basePrefix, myOrder, srcKey, trackedCopies);
                 String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, finalKey);
-                if (survivorUrls.contains(finalUrl)) return null;
-                return Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null);
-            }, imageExecutor);
-            futures.add(future);
-        }
-
-        try {
-            List<Image> toSave = futures.stream()
-                    .map(CompletableFuture::join)
-                    .filter(Objects::nonNull)
-                    .toList();
-            return new CopyResult(toSave, new ArrayList<>(trackedCopies));
+                if (!survivorUrls.contains(finalUrl)) {
+                    toSave.add(Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null));
+                }
+            }
+            return new CopyResult(toSave, trackedCopies);
         } catch (Exception e) {
-            imageOperationBatchService.compensate(new ArrayList<>(trackedCopies));
-            log.error("[Vote IMG] Parallel copy failed", e);
+            imageOperationBatchService.compensate(trackedCopies);
+            log.error("[Vote IMG] Sequential copy failed", e);
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
     }
@@ -202,7 +190,7 @@ public class MainContentImageServiceImpl implements MainContentImageService {
             String basePrefix,
             int order,
             String srcKey,
-            Queue<ImageOperationBatchService.TrackedCopy> trackedCopies
+            List<ImageOperationBatchService.TrackedCopy> trackedCopies
     ) {
         String base = basePrefix.endsWith("/") ? basePrefix.substring(0, basePrefix.length() - 1) : basePrefix;
         if (!storageClient.isStagingKey(srcKey)) return srcKey;

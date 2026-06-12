@@ -20,7 +20,6 @@ import core.global.exception.BusinessException;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Async;
@@ -37,9 +36,6 @@ import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignReques
 import java.io.IOException;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executor;
 
 @Slf4j
 @Service
@@ -53,8 +49,7 @@ public class PostImageServiceImpl implements PostImageService {
     private final S3Presigner s3Presigner;
     private final S3Props s3Props;
     private final ApplicationEventPublisher eventPublisher;
-    @Qualifier("imageExecutor")
-    private final Executor imageExecutor;
+
     @Value("${ncp.s3.bucket}")
     private String bucket;
     @Value("${ncp.s3.endpoint}")
@@ -149,7 +144,8 @@ public class PostImageServiceImpl implements PostImageService {
 
         final String basePrefix = "posts/" + postId;
 
-        CopyResult copyResult = copyNewImagesInParallel(
+        // imageExecutor 안에서 다시 작업을 제출하지 않고 현재 비동기 작업에서 순차 Copy한다.
+        CopyResult copyResult = copyNewImagesSequentially(
                 postId,
                 adds,
                 basePrefix,
@@ -200,7 +196,8 @@ public class PostImageServiceImpl implements PostImageService {
 
         final String basePrefix = "posts/" + postId;
 
-        CopyResult copyResult = copyNewImagesInParallel(
+        // imageExecutor 안에서 다시 작업을 제출하지 않고 현재 비동기 작업에서 순차 Copy한다.
+        CopyResult copyResult = copyNewImagesSequentially(
                 postId,
                 adds,
                 basePrefix,
@@ -362,7 +359,7 @@ public class PostImageServiceImpl implements PostImageService {
         return (list == null) ? List.of() : list;
     }
 
-    private CopyResult copyNewImagesInParallel(
+    private CopyResult copyNewImagesSequentially(
             Long postId,
             List<String> adds,
             String basePrefix,
@@ -370,39 +367,33 @@ public class PostImageServiceImpl implements PostImageService {
             int startOrder,
             ImageOperationType operationType
     ) {
-        var trackedCopies = new ConcurrentLinkedQueue<ImageOperationBatchService.TrackedCopy>();
-        List<CompletableFuture<Image>> futures = new ArrayList<>();
+        List<ImageOperationBatchService.TrackedCopy> trackedCopies = new ArrayList<>();
+        List<Image> toSave = new ArrayList<>(adds.size());
 
-        for (int i = 0; i < adds.size(); i++) {
-            final int myOrder = startOrder + i;
-            final String raw = adds.get(i);
-
-            var future = CompletableFuture.supplyAsync(() -> {
+        try {
+            for (int i = 0; i < adds.size(); i++) {
+                int myOrder = startOrder + i;
+                String raw = adds.get(i);
                 String srcKey = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, raw);
 
                 if (isDefaultUrlOrKey(srcKey)) {
                     String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, srcKey);
-                    if (survivorUrls.contains(finalUrl)) return null;
-                    return Image.of(ImageType.POST, postId, finalUrl, myOrder);
+                    if (!survivorUrls.contains(finalUrl)) {
+                        toSave.add(Image.of(ImageType.POST, postId, finalUrl, myOrder));
+                    }
+                    continue;
                 }
 
                 String finalKey = ensureFinalKey(postId, operationType, basePrefix, myOrder, srcKey, trackedCopies);
                 String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, finalKey);
-                if (survivorUrls.contains(finalUrl)) return null;
-                return Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null);
-            }, imageExecutor);
-            futures.add(future);
-        }
-
-        try {
-            List<Image> toSave = futures.stream()
-                    .map(CompletableFuture::join)
-                    .filter(Objects::nonNull)
-                    .toList();
-            return new CopyResult(toSave, new ArrayList<>(trackedCopies));
+                if (!survivorUrls.contains(finalUrl)) {
+                    toSave.add(Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null));
+                }
+            }
+            return new CopyResult(toSave, trackedCopies);
         } catch (Exception e) {
-            imageOperationBatchService.compensate(new ArrayList<>(trackedCopies));
-            log.error("[POST IMG] Parallel copy failed", e);
+            imageOperationBatchService.compensate(trackedCopies);
+            log.error("[POST IMG] Sequential copy failed", e);
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
     }
@@ -455,7 +446,7 @@ public class PostImageServiceImpl implements PostImageService {
             String basePrefix,
             int order,
             String srcKey,
-            Queue<ImageOperationBatchService.TrackedCopy> trackedCopies
+            List<ImageOperationBatchService.TrackedCopy> trackedCopies
     ) {
         String base = basePrefix.endsWith("/") ? basePrefix.substring(0, basePrefix.length() - 1) : basePrefix;
         if (!storageClient.isStagingKey(srcKey)) return srcKey;

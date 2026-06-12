@@ -4,7 +4,7 @@
 
 - 기준 브랜치: `feat/image-idempotency`
 - 마지막 완료 커밋은 `git log -1 --oneline`으로 확인한다.
-- 현재 구현 단계: 사용자·채팅방 프로필 생성·수정·삭제 및 직접 MultipartFile 업로드 안정화 완료
+- 현재 구현 단계: 사용자·채팅방 프로필과 일반 Post/Poll 이미지 생성·수정의 공통 Operation/Outbox 적용 완료
 - 작업 전 `AGENTS.md`, `docs/agent/project-context.md`, 인수인계 문서를 확인한다.
 - 이 문서는 이미지 생성·수정·삭제 흐름을 공통 `ImageOperation` 구조로 점진 통합하는 작업의 진행 상태를 기록한다.
 
@@ -86,7 +86,7 @@ FailedImageCleanup 저장
 ### 9. 검증 완료
 
 - 이미지 관련 대상 테스트가 통과했다.
-- `./scripts/agent-check.sh`는 164개 중 18개가 실패했다.
+- 최신 `./scripts/agent-check.sh`는 179개 중 18개가 실패했고, benchmark 4개는 기본 실행에서 skip됐다.
 - 전체 테스트 실패는 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"` 때문이다.
 - 이번 이미지 변경으로 확인된 테스트 실패는 없다.
 
@@ -99,21 +99,75 @@ FailedImageCleanup 저장
 - `UserAdminService.updateAiUser()`에서 기존 folder 선삭제를 제거해 새 이미지까지 삭제되는 위험을 막는다.
 - RabbitMQ 비활성화 시에는 직접 bulk delete와 기존 `FailedImageCleanup` fallback을 사용해 보상한다.
 
+### 11. 일반 Post/Poll 이미지 생성·수정
+
+- `ImageOperationBatchService`가 다중 이미지 Copy operation 추적, rollback compensation, 성공 후 cleanup 예약을 공통 처리한다.
+- 일반 Post 생성은 각 staging Copy를 `CREATE_POST_IMAGES`로 추적한다.
+- 일반 Post 수정은 각 staging Copy를 `UPDATE_POST_IMAGES`로 추적하고, 제거 이미지와 staging 원본을 `DELETE_OBJECT + Outbox`로 삭제한다.
+- Poll upsert는 각 staging Copy를 `UPDATE_POLL_IMAGES`로 추적하고, 제거 이미지와 staging 원본을 `DELETE_OBJECT + Outbox`로 삭제한다.
+- Copy 결과가 불명확하게 실패한 경우 해당 destination object도 compensation 대상으로 기록한다.
+- 현재 Poll 이미지는 기존 코드 동작대로 `ImageType.POST`를 사용하고 object folder는 `vote/{id}/`를 유지한다.
+
+### 12. 다중 이미지 DB 성능 Baseline
+
+- `ImageOperationDbBenchmarkTest`를 추가해 명시적 실행 시에만 실제 PostgreSQL DB 비용을 측정한다.
+- 개선 전 구조는 이미지 1장당 prepared statement 10개, Hibernate transaction 5개가 증가한다.
+- `PostImageServiceDbBenchmarkTest`를 추가해 `PostImageServiceImpl.savePostImages()`의 Image 저장, Operation/Outbox, 외부 transaction을 포함한 DB 비용을 측정한다.
+- Post 이미지 서비스 benchmark 최초 측정에서 20장은 prepared statement 221개, Hibernate transaction 101개가 발생했다.
+- `PostImageObjectStorageBenchmarkTest`를 추가해 실제 NCP Object Storage 병렬 Copy와 PostgreSQL 저장을 함께 측정할 수 있도록 했다.
+- 실제 Object Storage benchmark는 명시적으로 활성화할 때만 실행하며 benchmark object와 DB row를 사후 정리한다.
+- `8 MiB` JPEG 20장 Copy 동시성 비교에서 동시성 10은 중앙값 311ms로 안정적이었고, 동시성 20은 5회 중 4회가 1초 이상 걸렸다.
+- 운영 executor 전체 크기를 변경하기 전에 요청 단위 Copy 동시성 제한과 독립 재측정을 검토한다.
+- `scripts/k6/post-image-load-test.js`를 추가해 실제 Presigned URL 발급, NCP 이미지 업로드, Post 생성 API의 다중 사용자 부하를 측정할 수 있도록 했다.
+- Post 도배 제한 때문에 k6 VU마다 별도 Access Token을 사용하고 사용자당 iteration은 최대 3회로 제한한다.
+- 실제 `9.6MB` JPEG 5장을 사용하는 `1 VU × 1 iteration` k6 baseline이 성공했다.
+- 단일 사용자 기준 전체 흐름은 2.72초, 이미지 한 장 NCP 업로드 평균은 1.33초, Post 생성 API 응답은 18.78ms였다.
+- `5 VU × 이미지 5장`은 100% 성공했고 전체 사용자 흐름 p95는 5.61초였다.
+- `50 VU × 이미지 5장`은 100% 성공했지만 전체 사용자 흐름 p95 49.1초, NCP 업로드 p95 46.05초로 크게 지연됐다.
+- `100 VU × 이미지 5장`은 독립 재실행을 포함해 두 번 모두 NCP Presigned PUT 대부분이 약 60초 후 timeout 됐으며 Post API는 호출되지 않았다.
+- 현재 로컬 환경과 NCP bucket 기준으로 동시 PUT 250개는 느리지만 성공하고, 동시 PUT 500개는 안정적으로 처리하지 못하는 경계를 확인했다.
+- 측정 방법과 baseline 결과는 `docs/agent/image-operation-performance-baseline.md`에 기록했다.
+- Presign/NCP PUT만 측정하는 `post-image-upload-only-test.js`와 미리 준비된 staging key로 Post API만 측정하는 `post-image-post-only-test.js`를 추가했다.
+- `prepare-post-image-staging.sh`가 post-only 측정용 사용자별 고유 staging object와 manifest를 준비한다.
+- 병목 분리 테스트의 실제 실행 결과는 아직 측정하지 않았다.
+- upload-only `100 VU × 이미지 5장`에서 `UPLOAD_BATCH_SIZE=5`는 NCP PUT 497/500개가 timeout 됐고, `UPLOAD_BATCH_SIZE=1`은 500/500개가 성공했다.
+- `UPLOAD_BATCH_SIZE=2`도 500/500개가 성공했지만 업로드 p95는 44.79초로 `UPLOAD_BATCH_SIZE=1`의 20.74초보다 크게 악화됐다.
+- 동시성을 높여도 전체 처리량이 약 51~55MB/s에서 증가하지 않아 단일 부하 발생기 또는 현재 네트워크 경로의 업로드 처리량 포화가 강한 병목 후보다.
+- post-only 측정은 남아 있다.
+- post-only `100 VU × 이미지 5장`에서 Post 생성은 18/100건 성공했고 82건은 약 30.15초 후 HTTP 500으로 실패했다.
+- 동일 `imageExecutor`의 외부 `@Async` 작업과 내부 `CompletableFuture` Copy 중첩, `CallerRunsPolicy`, Hikari 기본 pool 10개, 다수 `REQUIRES_NEW` transaction이 결합된 DB connection pool 고갈이 가장 유력한 병목 후보다.
+- 직접 Hikari timeout 예외는 서버 로그에서 추가 확인해야 한다.
+- Hikari pool 25, connection timeout 3초로 동일 post-only 테스트를 재실행하자 성공률이 `18% → 96%`로 증가하고 실패시간이 약 `30초 → 3초`로 변경됐다.
+- 설정 변경에 따른 결과 차이로 DB connection pool 고갈이 HTTP 500의 직접 원인이라는 강한 근거를 확보했다.
+- 테스트 종료 10초 후에도 operation과 Copy step의 `PENDING/PROCESSING` 상태가 변하지 않아 동일 `imageExecutor` 중첩 사용에 따른 비동기 작업 정체가 남아 있다.
+- Post/Poll 이미지 처리에서 내부 `CompletableFuture.supplyAsync(..., imageExecutor)`와 `join()`을 제거했다.
+- 바깥 `@Async("imageExecutor")`는 유지하고, 하나의 비동기 작업 thread가 요청 안의 이미지를 순차 Copy하도록 변경했다.
+- 중첩 executor 제거 후 Post/Poll 안정성 대상 테스트와 compile이 통과했다.
+- 중첩 executor 제거 후 DB benchmark는 이미지 5장 기준 56 statements, 26 transactions로 기존과 동일했다. 이번 변경은 executor 정체 제거이며 DB 접근량 개선은 다음 단계다.
+- 실제 PostgreSQL 검증 중 assigned UUID entity의 `@Version` 수동 초기화가 신규 저장을 방해하는 문제를 발견해 제거했다.
+
 ## 현재 진행 중인 작업
 
-- 없음. 다음 구현 대상은 Outbox 발행 지연 개선이다.
+- 동일 `imageExecutor` 중첩 제거를 완료했다.
+- 다음 작업은 서버 재시작 후 동일 `100 VU post-only` 재측정과 DB connection/transaction 증폭 축소다.
 
 ## 남은 작업
 
 ### 가까운 범위
 
-- Outbox 발행 지연 개선: transaction commit 직후 즉시 발행을 시도하고 현재 polling relay는 fallback으로 유지
+- Post/Poll 이미지 작업의 동일 `imageExecutor` 중첩 사용 제거
+- 이미지별 `REQUIRES_NEW` 상태 갱신을 요청 단위 batch transaction으로 축소
+- 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조 검토
+- 2코어·8GB 환경을 고려한 제한된 Consumer/Copy 동시성 설계
+- 현재 polling 기반 Outbox 처리 지연 측정
+- 측정 결과에 따른 Outbox 발행 지연 개선 여부 결정
 - 직접 업로드 처리 중 서버 종료로 `UPLOAD_OBJECT`가 `PROCESSING`에 남는 경우의 안전한 복구 정책 검토
+- Post/Poll 요청당 Copy 동시성 제한 적용 여부 결정
+- 클라이언트 이미지 업로드 동시성 제한 또는 분산 부하 환경의 추가 검증 여부 결정
 
 ### 다음 확장 범위
 
-- `PostImageServiceImpl`의 생성·수정·삭제 cleanup을 공통 구조로 전환
-- Poll 이미지 생성·수정·삭제 cleanup을 공통 구조로 전환
+- 관리자 Post `MultipartFile` 직접 업로드와 크롤러 외부 URL 업로드의 operation/compensation 적용
 - 그 외 이미지 소유자 흐름을 동일 원칙으로 점진 적용
 - Copy retry와 `REGISTER_IMAGE_DB`를 하나의 연속 파이프라인으로 설계
 - moderation event의 Outbox 적용 여부 결정
@@ -128,7 +182,10 @@ FailedImageCleanup 저장
 
 ## 다음 우선순위 작업
 
-1. Outbox 발행 지연을 줄이되 polling relay를 fallback으로 유지한다.
-2. 이후 Post/Poll의 생성·수정·삭제 흐름으로 확장한다.
+1. 서버를 재시작하고 동일 `100 VU post-only` 테스트로 중첩 executor 제거 효과를 측정한다.
+2. 이미지 Copy orchestration과 Image DB 저장 transaction 경계를 분리해 바깥 transaction의 connection 장기 점유를 제거한다.
+3. 이미지별 operation 생성과 `REQUIRES_NEW` 상태 갱신을 요청 단위 operation 및 batch 저장으로 축소한다.
+4. 개선 전후 DB benchmark와 `100 VU post-only` 테스트를 동일 조건으로 비교한다.
+5. 2코어·8GB 서버 기준 Consumer/Copy 동시성 및 Hikari pool 크기를 측정 결과로 결정한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.

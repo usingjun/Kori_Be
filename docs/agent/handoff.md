@@ -55,6 +55,11 @@
 - 채팅방 프로필 삭제의 `DELETE_FOLDER + Outbox` 적용
 - 사용자 프로필 직접 MultipartFile 업로드의 operation 추적과 보상 삭제 적용
 - AI 사용자 프로필 교체의 folder 선삭제 제거
+- 일반 Post presigned 이미지 생성·수정의 공통 Operation/Outbox 적용
+- Poll 이미지 upsert의 공통 Operation/Outbox 적용
+- 다중 이미지 Copy의 이미지별 operation 추적과 부분 성공 compensation 적용
+- 다중 이미지 DB 성능 baseline 측정용 `ImageOperationDbBenchmarkTest` 추가
+- assigned UUID operation entity의 `@Version` 신규 판별 문제 수정
 
 ### 현재 완료 상태
 
@@ -80,6 +85,11 @@ UPLOAD_OBJECT step 생성
 → Image DB upsert
 → 성공 시 기존 object DELETE_OBJECT Outbox
 → 실패/rollback 시 새 object compensation
+
+일반 Post/Poll 다중 이미지:
+각 staging image Copy를 독립 operation으로 추적
+→ DB 저장 성공 시 staging/removed object DELETE_OBJECT Outbox
+→ 일부 Copy 또는 DB 저장 실패 시 성공한 final object만 compensation
 ```
 
 실패 시 의미:
@@ -94,7 +104,7 @@ UPLOAD_OBJECT step 생성
 - RabbitMQ 비활성화 시 compensation은 직접 bulk delete로 실행하고 실패 기록은 기존 `FailedImageCleanup`이 담당한다.
 
 `ProfileImageServiceImplTest`, `ImageOperationRecoveryServiceTest`, 이미지 관련 대상 테스트를 통과했다.
-`./scripts/agent-check.sh`는 164개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했으며, 이번 이미지 변경으로 확인된 실패는 없다.
+최신 `./scripts/agent-check.sh`는 179개 중 18개가 기존 `pgroonga` extension 생성 권한 문제로 실패했고, benchmark 4개는 기본 실행에서 skip됐다. 이번 이미지 변경으로 확인된 실패는 없다.
 
 ### 현재 데이터/메시지 흐름
 
@@ -132,10 +142,10 @@ Domain Service
 
 ### 즉시 이어갈 작업
 
-1. `ImageOperationOutboxRelay`의 polling 발행 지연과 현재 transaction commit 이후 호출 지점을 확인한다.
-2. commit 직후 즉시 발행 시도와 polling fallback을 함께 유지하는 방식을 설계한다.
-3. 즉시 발행 실패가 domain transaction 결과를 변경하지 않도록 경계를 확인한다.
-4. broker 장애 시 polling relay가 pending Outbox를 재발행하는 테스트를 추가한다.
+1. 서버를 재시작해 중첩 `imageExecutor` 제거 코드를 반영한다.
+2. 새 staging manifest로 동일 `100 VU post-only`를 재실행한다.
+3. 이미지별 `REQUIRES_NEW` transaction을 요청 단위 batch 저장으로 축소하는 경계를 설계한다.
+4. 요청 단위 `ImageOperation` 1개와 이미지별 step 구조로 변경할 때 compensation/retry/DLQ 의미를 확인한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -150,7 +160,7 @@ staging Copy
 
 ### 이후 확장
 
-- Post/Poll 이미지 생성·수정·삭제
+- 관리자 Post `MultipartFile` 직접 업로드와 크롤러 외부 URL 업로드
 - 그 외 image owner 흐름
 - Outbox 발행 지연 개선
 - Copy retry + `REGISTER_IMAGE_DB` 연속 파이프라인
@@ -163,11 +173,11 @@ staging Copy
 다음 Codex는 새 구현을 시작하기 전에 아래를 먼저 수행해야 한다.
 
 1. `git status --short`와 `git log -1 --oneline`으로 현재 상태를 확인한다.
-2. `ImageOperationOutboxRelay`와 Outbox 저장 호출 지점을 확인한다.
-3. commit 직후 즉시 발행과 polling fallback의 경계를 구현 전에 짧게 보고한다.
-4. 구현 후 이미지 대상 테스트와 `git diff --check`를 실행한다.
+2. `ImageOperationOutboxRelay`의 polling 주기와 Post/Poll Outbox 생성 시점을 확인한다.
+3. 실제 발행·Consumer 완료 시간 측정 방법을 먼저 정한다.
+4. 측정 후 즉시 발행 필요성을 판단하고, 구현 시 polling fallback 경계를 유지한다.
 
-새 구현의 첫 대상은 Outbox 발행 지연 개선이다.
+새 작업의 첫 대상은 Post/Poll 이미지 처리의 DB connection/transaction 증폭 개선이다. 측정 근거와 실행 방법은 `docs/agent/image-operation-performance-baseline.md`, `docs/agent/post-image-k6-test-guide.md`를 확인한다.
 
 ## 수정하면 안 되는 부분
 
@@ -208,3 +218,10 @@ staging Copy
 - `COPY_STAGING_TO_FINAL`의 완전 비동기 retry는 `REGISTER_IMAGE_DB` 없이 단독 구현하면 안 된다.
 - 직접 업로드는 compensation이 적용됐지만 moderation event 발행 여부는 기존 동작을 유지하고 있으며 별도 확장 대상이다.
 - 직접 업로드 중 서버 종료로 `UPLOAD_OBJECT`가 `PROCESSING`에 남는 경우 bytes를 재구성할 수 없어 자동 업로드 재시도는 불가능하다. 안전한 timeout 복구 정책은 별도 설계가 필요하다.
+- 일반 Post/Poll의 presigned staging Copy 흐름은 공통 구조로 전환됐지만, 관리자 `MultipartFile` Post 업로드와 크롤러 외부 URL 업로드는 아직 기존 동기 S3 처리 흐름이다.
+- 현재 Poll 이미지는 `ImageType.POST`를 공유한다. 이는 기존 동작을 유지한 것이며 별도 type으로 분리한 것이 아니다.
+- 개선 전 다중 이미지 구조는 이미지 1장당 prepared statement 10개, Hibernate transaction 5개가 증가한다. 상세 측정 방법은 `docs/agent/image-operation-performance-baseline.md`를 확인한다.
+- `100 VU post-only`에서 Hikari pool 10개는 18% 성공, pool 25개는 96% 성공했지만 비동기 operation 정체가 남았다. pool 확대만으로 해결하지 않는다.
+- 목표 서버는 2코어·8GB이므로 executor와 DB pool을 크게 설정하는 방식보다 제한된 동시성과 batch transaction을 우선한다.
+- Post/Poll 내부 Copy의 동일 `imageExecutor` 재제출과 `join()`은 제거됐다. 바깥 `@Async`는 유지하며 내부 Copy는 순차 실행한다.
+- 중첩 제거 후 DB benchmark 수치는 이미지 5장 기준 56 statements, 26 transactions로 동일하므로 DB transaction 축소는 아직 미구현이다.

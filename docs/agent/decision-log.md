@@ -188,7 +188,7 @@ operation 완료 여부는 관련 step 전체 상태로 판정해야 한다. 보
 
 ### 결정
 
-최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자·채팅방 프로필 생성·수정·삭제와 사용자 프로필 직접 MultipartFile 업로드까지 진행했으며, Post/Poll은 후속 단계다.
+최종 적용 대상은 이미지 생성·수정·삭제 전체다. 현재는 사용자·채팅방 프로필, 사용자 프로필 직접 MultipartFile 업로드, 일반 Post presigned 이미지 생성·수정, Poll upsert까지 진행했다. 관리자 Post 직접 업로드와 크롤러 외부 URL 업로드는 후속 단계다.
 
 ### 이유
 
@@ -299,6 +299,46 @@ DB 등록만 나중에 재시도하면 원래 AI User 생성/수정 transaction�
 - RabbitMQ 비활성화 시 compensation Outbox를 기다리지 않고 직접 bulk delete를 실행하며, 삭제 실패는 기존 `FailedImageCleanup` fallback에 맡긴다.
 - 직접 업로드 중 서버가 종료되면 bytes를 재구성할 수 없으므로 `UPLOAD_OBJECT`를 자동 재시도해서는 안 된다.
 
+## 15. 다중 Post/Poll Copy는 이미지별 operation으로 추적한다
+
+### 결정
+
+- 일반 Post/Poll의 staging Copy는 이미지마다 독립된 `ImageOperation`과 `COPY_STAGING_TO_FINAL` step으로 추적한다.
+- 다중 Copy 중 일부만 성공한 뒤 다른 Copy나 DB 저장이 실패하면 성공한 final object만 각각 compensation 처리한다.
+- 정상 성공 후 staging/removed object 삭제는 `DELETE_OBJECT + Outbox`로 처리한다.
+
+### 이유
+
+다중 이미지 요청은 일부 Copy만 성공할 수 있다. 하나의 operation에 모든 Copy를 묶으면 특정 이미지의 실패와 보상 대상을 구분하기 어렵고, 독립 retry/DLQ 상태도 표현하기 어렵다.
+
+### 채택하지 않은 대안
+
+- Post/Poll 요청 전체를 하나의 Copy step으로 추적
+- Copy 성공 직후 staging object 동기 삭제
+- DB rollback 여부와 무관하게 removed object를 먼저 삭제
+
+### 변경 시 주의
+
+- 현재 Poll 이미지는 기존 구조상 `ImageType.POST`를 공유하고 folder만 `vote/{id}/`를 사용한다. 별도 `ImageType.POLL`로 변경하려면 조회·삭제·migration 영향을 별도로 검토해야 한다.
+- 관리자 `MultipartFile` Post 업로드와 크롤러 외부 URL 업로드는 staging Copy 흐름이 아니므로 별도 직접 업로드 보상 설계가 필요하다.
+- Outbox 발행 지연 개선은 실제 polling 처리 시간 측정 후 결정하며, 적용하더라도 polling relay를 fallback으로 유지한다.
+
+## 16. assigned UUID entity의 신규 판별을 위해 `@Version`을 수동 초기화하지 않는다
+
+### 결정
+
+`ImageOperation`과 `ImageOperationStep` 생성 시 `version = 0L`을 직접 설정하지 않는다. 신규 entity의 version은 Hibernate가 persist 과정에서 초기화하게 한다.
+
+### 이유
+
+Spring Data JPA는 assigned ID entity에서 nullable `@Version`을 신규 여부 판별에 사용한다. 생성 시 version을 `0L`로 설정하면 신규 entity를 기존 entity로 판단해 `merge/update`를 시도하고, 실제 PostgreSQL에서 `ObjectOptimisticLockingFailureException`이 발생한다.
+
+### 변경 시 주의
+
+- DB의 version column과 optimistic locking 동작은 유지한다.
+- assigned UUID와 `@Version`을 함께 쓰는 신규 entity는 persist 전에 version을 직접 채우지 않는다.
+- Mockito repository 테스트만으로는 신규 판별 문제가 드러나지 않으므로 실제 PostgreSQL 통합 검증을 유지한다.
+
 ## 15. AI 사용자 프로필 교체 시 folder를 선삭제하지 않는다
 
 ### 결정
@@ -319,3 +359,53 @@ DB 등록만 나중에 재시도하면 원래 AI User 생성/수정 transaction�
 
 - 사용자 탈퇴나 명시적인 전체 프로필 삭제에서는 기존 `DELETE_FOLDER`를 유지한다.
 - 프로필 교체에서는 `DELETE_OBJECT`만 사용해야 한다.
+
+## 17. Post/Poll 이미지 처리의 DB connection 증폭을 구조적으로 개선한다
+
+### 결정
+
+- Hikari pool 크기만 늘리는 방식은 최종 해결책으로 사용하지 않는다.
+- Post/Poll 다중 이미지 흐름에서 동일 `imageExecutor`를 외부 `@Async` 작업과 내부 Copy에 중첩 사용하지 않는다.
+- 이미지별 `ImageOperation`과 여러 `REQUIRES_NEW` 상태 갱신을 요청 단위 operation과 batch transaction으로 축소하는 방향을 우선 검토한다.
+- 2코어·8GB 서버를 기준으로 제한된 동시성을 사용한다.
+
+### 이유
+
+`100 VU × 이미지 5장` post-only 측정에서 기본 Hikari pool 10개는 18건만 성공하고 82건이 약 30초 후 실패했다. Hikari pool 25개와 connection timeout 3초를 적용하자 96건이 성공했지만 4건은 약 3초 후 실패했고, 테스트 종료 10초 후에도 operation/step의 `PENDING/PROCESSING` 상태가 유지됐다.
+
+현재 Post 이미지 5장은 약 56개 prepared statement와 26개 transaction을 발생시킨다. 동시 Post 100개에서는 약 5,600개 statement와 2,600개 transaction 요청으로 증폭된다. 작은 서버에서 pool만 늘리면 DB 경쟁과 context switching을 증가시킬 수 있다.
+
+### 채택하지 않은 대안
+
+- Hikari pool만 계속 확대
+- `imageExecutor` thread 수만 확대
+- `CallerRunsPolicy`를 유지한 채 HTTP timeout만 증가
+- 안정성 추적을 제거해 DB 비용을 줄이기
+
+### 변경 시 주의
+
+- operation/step 추적, compensation, retry/DLQ, idempotency는 유지해야 한다.
+- 요청 단위 operation으로 변경하더라도 이미지별 실패 및 보상 대상은 step 단위로 구분해야 한다.
+- transaction을 합칠 때 일부 Copy 성공 후 DB rollback 시 compensation 대상이 누락되지 않아야 한다.
+- 개선 전후 동일한 DB benchmark와 `100 VU post-only` 테스트로 검증해야 한다.
+
+## 18. Post/Poll 내부 Copy는 동일 imageExecutor에 다시 제출하지 않는다
+
+### 결정
+
+`PostImageServiceImpl`과 `MainContentImageServiceImpl`의 바깥 `@Async("imageExecutor")`는 유지한다. 내부 이미지 Copy는 `CompletableFuture.supplyAsync(..., imageExecutor)`로 다시 제출하지 않고 현재 비동기 작업 thread에서 순차 실행한다.
+
+### 이유
+
+기존 구조는 `imageExecutor` thread가 같은 executor에 내부 Copy를 제출한 뒤 `join()`으로 기다렸다. 부하가 커지면 실행 가능한 thread가 대기 상태가 되고 내부 작업이 실행되지 않는 thread starvation 위험이 있었다. 2코어 서버에서 이미지 최대 5장의 내부 병렬성보다 작업 정체 방지가 더 중요하다.
+
+### 트레이드오프
+
+- 단일 Post/Poll의 이미지 Copy 완료시간은 병렬 Copy보다 길어질 수 있다.
+- Post API는 바깥 `@Async`를 유지하므로 Copy 완료를 기다리지 않는다.
+- DB statement와 transaction 수는 이번 변경으로 줄지 않는다.
+
+### 변경 시 주의
+
+- 내부 병렬 Copy를 다시 도입하려면 바깥 orchestration executor와 분리된 제한된 executor 또는 RabbitMQ Consumer 동시성을 사용해야 한다.
+- 중첩 제거 효과와 DB 병목을 구분하기 위해 동일 `100 VU post-only` 테스트를 먼저 재실행한다.
