@@ -103,7 +103,6 @@ public class ImageOperationStep {
         step.sourceContentLength = sourceContentLength;
         step.attemptCount = 0;
         step.maxAttempts = maxAttempts;
-        step.version = 0L;
         step.createdAt = now;
         step.updatedAt = now;
         return step;
@@ -124,7 +123,6 @@ public class ImageOperationStep {
         step.targetKey = requireText(targetKey, "targetKey");
         step.attemptCount = 0;
         step.maxAttempts = maxAttempts;
-        step.version = 0L;
         step.createdAt = now;
         step.updatedAt = now;
         return step;
@@ -170,7 +168,6 @@ public class ImageOperationStep {
         step.targetKey = requireText(targetKey, "targetKey");
         step.attemptCount = 0;
         step.maxAttempts = maxAttempts;
-        step.version = 0L;
         step.createdAt = now;
         step.updatedAt = now;
         return step;

@@ -68,7 +68,6 @@ public class ImageOperation {
         operation.ownerType = Objects.requireNonNull(ownerType);
         operation.ownerId = Objects.requireNonNull(ownerId);
         operation.status = ImageOperationStatus.PENDING;
-        operation.version = 0L;
         operation.createdAt = now;
         operation.updatedAt = now;
         return operation;

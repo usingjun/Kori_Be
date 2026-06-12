@@ -50,6 +50,8 @@ class ImageOperationServiceTest {
         );
 
         ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        verify(operationRepository).save(operationCaptor.capture());
         verify(stepRepository).save(stepCaptor.capture());
         assertThat(plan.operationId()).isNotNull();
         assertThat(plan.stepId()).isNotNull();
@@ -57,6 +59,8 @@ class ImageOperationServiceTest {
         assertThat(stepCaptor.getValue().getOperationId()).isEqualTo(plan.operationId());
         assertThat(stepCaptor.getValue().getTargetKey()).isEqualTo(plan.targetKey());
         assertThat(stepCaptor.getValue().getSourceContentLength()).isEqualTo(1024L);
+        assertThat(operationCaptor.getValue().getVersion()).isNull();
+        assertThat(stepCaptor.getValue().getVersion()).isNull();
     }
 
     @Test

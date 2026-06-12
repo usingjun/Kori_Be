@@ -3,10 +3,13 @@ package core.global.entity.image.service.impl;
 import core.global.entity.image.dto.ImageModerationEvent;
 import core.global.entity.image.entity.Image;
 import core.global.entity.image.repository.ImageRepository;
+import core.global.entity.image.service.ImageOperationBatchService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.utils.UrlUtil;
 import core.global.enums.ImageModerationStatus;
 import core.global.enums.PollType;
+import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageOperationType;
 import core.global.enums.common.ImageType;
 import core.global.enums.errorcode.ImageErrorCode;
 import core.global.exception.BusinessException;
@@ -18,11 +21,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import software.amazon.awssdk.core.exception.SdkException;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.MetadataDirective;
-import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
-import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -34,13 +32,13 @@ import java.util.concurrent.Executor;
 @RequiredArgsConstructor
 public class MainContentImageServiceImpl implements MainContentImageService {
 
-    private final S3Client s3Client;
     private final ImageRepository imageRepository;
     private final ImageStorageClient storageClient;
+    private final ImageOperationBatchService imageOperationBatchService;
     private final ApplicationEventPublisher eventPublisher;
-    
     @Qualifier("imageExecutor")
     private final Executor imageExecutor;
+
     @Value("${ncp.s3.bucket}")
     private String bucket;
     @Value("${ncp.s3.endpoint}")
@@ -66,15 +64,14 @@ public class MainContentImageServiceImpl implements MainContentImageService {
 
         // 추가할 이미지가 없다면 여기서 S3 삭제 처리 후 종료
         if (adds.isEmpty()) {
-            if (!bulkDeleteKeys.isEmpty()) {
-                storageClient.deleteObjectsBulk(bulkDeleteKeys);
-            }
+            imageOperationBatchService.scheduleCleanup(
+                    ImageOperationOwnerType.POLL, id, List.of(), bulkDeleteKeys
+            );
             return;
         }
 
         final String basePrefix = "vote/" + id;
 
-        // 3) [병렬 Copy] Staging -> Production 복사 (생존 이미지 다음 순서부터 시작)
         CopyResult copyResult = copyNewImagesInParallel(
                 id,
                 adds,
@@ -82,17 +79,23 @@ public class MainContentImageServiceImpl implements MainContentImageService {
                 survivorContext.survivorUrls(),
                 survivorContext.nextPosition()
         );
+        imageOperationBatchService.registerRollbackCompensation(copyResult.trackedCopies());
 
-        // 4) [DB 저장] 새로 추가된 이미지 저장
-        if (!copyResult.toSave().isEmpty()) {
-            List<Image> savedImages = imageRepository.saveAll(copyResult.toSave());
-            publishModerationEvents(savedImages);
-        }
-
-        // 5) [S3 삭제] 사용자 삭제분 + Staging 원본 일괄 삭제
-        bulkDeleteKeys.addAll(copyResult.stagingToDelete());
-        if (!bulkDeleteKeys.isEmpty()) {
-            storageClient.deleteObjectsBulk(bulkDeleteKeys);
+        try {
+            if (!copyResult.toSave().isEmpty()) {
+                List<Image> savedImages = imageRepository.saveAll(copyResult.toSave());
+                imageRepository.flush();
+                publishModerationEvents(savedImages);
+            }
+            imageOperationBatchService.scheduleCleanup(
+                    ImageOperationOwnerType.POLL,
+                    id,
+                    copyResult.trackedCopies(),
+                    bulkDeleteKeys
+            );
+        } catch (RuntimeException e) {
+            imageOperationBatchService.compensate(copyResult.trackedCopies());
+            throw e;
         }
     }
 
@@ -115,9 +118,7 @@ public class MainContentImageServiceImpl implements MainContentImageService {
             Set<String> survivorUrls,
             int startOrder
     ) {
-        var stagingToDelete = new ConcurrentLinkedQueue<String>();
-
-        // 1. CompletableFuture를 사용하여 imageExecutor에서 비동기 작업 스트림 생성
+        var trackedCopies = new ConcurrentLinkedQueue<ImageOperationBatchService.TrackedCopy>();
         List<CompletableFuture<Image>> futures = new ArrayList<>();
 
         for (int i = 0; i < adds.size(); i++) {
@@ -127,37 +128,28 @@ public class MainContentImageServiceImpl implements MainContentImageService {
             var future = CompletableFuture.supplyAsync(() -> {
                 String srcKey = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, raw);
 
-                // 1) 기본 이미지인 경우
                 if (isDefaultUrlOrKey(srcKey)) {
                     String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, srcKey);
                     if (survivorUrls.contains(finalUrl)) return null;
                     return Image.of(ImageType.POST, postId, finalUrl, myOrder);
                 }
 
-                // 2) 일반/스테이징 이미지인 경우
-                String finalKey = ensureFinalKey(basePrefix, myOrder, srcKey);
+                String finalKey = ensureFinalKey(postId, basePrefix, myOrder, srcKey, trackedCopies);
                 String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, finalKey);
                 if (survivorUrls.contains(finalUrl)) return null;
-
-                if (storageClient.isStagingKey(srcKey) && !srcKey.equals(finalKey) && !isDefaultUrlOrKey(srcKey)) {
-                    stagingToDelete.add(srcKey);
-                }
-
                 return Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null);
             }, imageExecutor);
-
             futures.add(future);
         }
 
-        // 2. 모든 작업이 완료될 때까지 대기 및 결과 수집
         try {
             List<Image> toSave = futures.stream()
-                    .map(CompletableFuture::join) // 결과가 나올 때까지 대기
+                    .map(CompletableFuture::join)
                     .filter(Objects::nonNull)
                     .toList();
-
-            return new CopyResult(toSave, new ArrayList<>(stagingToDelete));
+            return new CopyResult(toSave, new ArrayList<>(trackedCopies));
         } catch (Exception e) {
+            imageOperationBatchService.compensate(new ArrayList<>(trackedCopies));
             log.error("[Vote IMG] Parallel copy failed", e);
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
@@ -205,7 +197,13 @@ public class MainContentImageServiceImpl implements MainContentImageService {
         return k.startsWith("default/"); // 예: default/character_03.png
     }
 
-    private String ensureFinalKey(String basePrefix, int order, String srcKey) {
+    private String ensureFinalKey(
+            Long pollId,
+            String basePrefix,
+            int order,
+            String srcKey,
+            Queue<ImageOperationBatchService.TrackedCopy> trackedCopies
+    ) {
         String base = basePrefix.endsWith("/") ? basePrefix.substring(0, basePrefix.length() - 1) : basePrefix;
         if (!storageClient.isStagingKey(srcKey)) return srcKey;
 
@@ -213,23 +211,15 @@ public class MainContentImageServiceImpl implements MainContentImageService {
         String dstKey = "%s/%03d_%s".formatted(base, order, basename);
         if (srcKey.equals(dstKey)) return srcKey;
 
-        try {
-            s3Client.copyObject(b -> b
-                    .sourceBucket(bucket).sourceKey(srcKey)
-                    .destinationBucket(bucket).destinationKey(dstKey)
-                    .acl(ObjectCannedACL.PUBLIC_READ)
-                    .metadataDirective(MetadataDirective.COPY)
-            );
-        } catch (S3Exception e) {
-            log.warn("[POST IMG] copy failed: src={}, dst={}, status={}, msg={}",
-                    srcKey, dstKey, e.statusCode(),
-                    e.awsErrorDetails() != null ? e.awsErrorDetails().errorMessage() : e.getMessage());
-            throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
-        } catch (SdkException e) {
-            log.warn("[POST IMG] copy failed: src={}, dst={}, err={}", srcKey, dstKey, e.getMessage());
-            throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
-        }
-        return dstKey; // ← 여기서 삭제하지 않음
+        ImageOperationBatchService.TrackedCopy trackedCopy = imageOperationBatchService.copy(
+                ImageOperationType.UPDATE_POLL_IMAGES,
+                ImageOperationOwnerType.POLL,
+                pollId,
+                srcKey,
+                dstKey
+        );
+        trackedCopies.add(trackedCopy);
+        return trackedCopy.targetKey();
     }
 
     private record SurvivorContext(
@@ -241,7 +231,7 @@ public class MainContentImageServiceImpl implements MainContentImageService {
 
     private record CopyResult(
             List<Image> toSave,
-            List<String> stagingToDelete
+            List<ImageOperationBatchService.TrackedCopy> trackedCopies
     ) {
     }
 }
