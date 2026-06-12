@@ -299,6 +299,55 @@ DB 등록만 나중에 재시도하면 원래 AI User 생성/수정 transaction�
 - RabbitMQ 비활성화 시 compensation Outbox를 기다리지 않고 직접 bulk delete를 실행하며, 삭제 실패는 기존 `FailedImageCleanup` fallback에 맡긴다.
 - 직접 업로드 중 서버가 종료되면 bytes를 재구성할 수 없으므로 `UPLOAD_OBJECT`를 자동 재시도해서는 안 된다.
 
+## 15. Copy 완료 상태 기록 실패도 Copy 실패와 동일하게 종결한다
+
+### 결정
+
+- NCP Copy가 모두 성공해도 `completeCopies()` transaction이 실패하면 해당 요청의 전체 Copy plan을 `FAILED`로 종결한다.
+- 완료 상태 기록 실패 시 모든 target object에 compensation 삭제를 예약한다.
+- 실패 상태 기록 transaction 자체가 실패해도 compensation 예약은 계속 시도한다.
+
+### 이유
+
+Copy 전에 operation/step을 `PROCESSING`으로 저장하므로, Copy 성공 후 완료 상태 기록만 실패하면 작업 thread는 종료됐는데 DB에는 계속 실행 중으로 남는다. 또한 상위 코드가 `TrackedCopy` 결과를 받지 못해 final object와 Image DB 사이의 정합성도 깨질 수 있다.
+
+### 채택하지 않은 대안
+
+- 완료 상태 기록이 실패해도 로그만 남기고 종료
+- `completeCopies()`만 무조건 재시도
+- 완료 여부가 불명확한 Copy를 성공으로 간주
+
+### 변경 시 주의
+
+- Copy 상태 기록 실패 시 `REGISTER_IMAGE_DB`가 실행되지 않으므로 Copy만 재시도하면 안 된다.
+- target object 삭제는 멱등성을 활용할 수 있지만 staging source object는 삭제하지 않는다.
+- 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` 상태의 자동 복구는 별도 timeout 정책으로 구현해야 한다.
+
+## 16. Post/Poll presigned 이미지 작업의 동시 실행 수를 제한한다
+
+### 결정
+
+- Post/Poll presigned 이미지 생성·수정은 전용 `postImageExecutor`를 사용한다.
+- 동시에 최대 10개 요청만 실행하고, 추가 요청은 최대 200개까지 queue에서 대기시킨다.
+- queue 초과 시 `CallerRunsPolicy`로 작업 유실 대신 호출 thread에 역압력을 건다.
+- 인터페이스에 남아 있던 불필요한 `@Transactional`을 제거해 NCP Copy 구간을 DB transaction 밖에서 실행한다.
+
+### 이유
+
+50 VU 측정에서 Post API는 모두 성공했지만 `Could not open JPA EntityManager for transaction`으로 90개 Copy step이 실패했다. 공용 `imageExecutor`는 최대 150개 worker를 허용하며 Hikari pool 25개보다 많은 DB transaction을 동시에 시작할 수 있었다. 또한 인터페이스의 잔여 `@Transactional`은 Copy 전체가 transaction으로 감싸질 위험이 있었다.
+
+### 채택하지 않은 대안
+
+- Hikari pool과 DB connection 수만 확대
+- 공용 `imageExecutor`의 전체 크기 축소
+- 실패한 Copy step을 상태 확인 없이 자동 재시도
+
+### 변경 시 주의
+
+- 고정 동시성 10은 현재 로컬 측정과 목표 서버 `2코어 / 8GB`를 고려한 시작값이며 운영 측정 후 조정해야 한다.
+- queue는 메모리 기반이므로 서버 종료 시 대기 작업이 유실될 수 있다. 장기적으로 durable 작업 Outbox를 검토해야 한다.
+- queue 초과 시 `CallerRunsPolicy` 때문에 Post API 응답시간이 증가할 수 있지만 작업 유실보다 안전한 선택이다.
+
 ## 15. 다중 Post/Poll Copy는 이미지별 operation으로 추적한다
 
 ### 결정

@@ -92,8 +92,21 @@ public class ImageOperationBatchService {
             }
         }
 
-        batchTransactionService.completeCopies(results);
-        return completedCopies;
+        try {
+            batchTransactionService.completeCopies(results);
+            return completedCopies;
+        } catch (RuntimeException e) {
+            try {
+                batchTransactionService.recordCompletionFailure(plans, e.getMessage());
+            } catch (RuntimeException stateError) {
+                log.error("[ImageBatch] copy completion failure state record failed operationCount={}",
+                        plans.size(), stateError);
+            }
+            compensate(plans.stream()
+                    .map(plan -> new TrackedCopy(plan.operationId(), plan.sourceKey(), plan.targetKey()))
+                    .toList());
+            throw e;
+        }
     }
 
     public void registerRollbackCompensation(List<TrackedCopy> copies) {

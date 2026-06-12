@@ -490,6 +490,38 @@ Post/Poll orchestration 전체의 `@Transactional`을 제거하고 다음 경계
 - Outbox 지연만 문제라면 polling fallback은 유지하면서 commit 직후 발행 신호를 추가하는 방안을 검토한다.
 - 허용 가능한 API 응답시간과 cleanup 완료시간 기준은 저장소에서 확인되지 않아 사용자가 결정해야 한다.
 
+## 최초 구조와 최종 구조 비교
+
+중간 개선 단계는 제외하고, 최초 `PostImageServiceDbBenchmarkTest` 결과와 최종 transaction 경계 분리 구조를 비교한다.
+
+| 이미지 수 | 최초 실행시간 | 최종 실행시간 | 최초 Prepared statements | 최종 Prepared statements | 최초 Hibernate transactions | 최종 Hibernate transactions |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 107ms | 140ms | 12 | 9 | 6 | 5 |
+| 5 | 46ms | 33ms | 56 | 33 | 26 | 9 |
+| 10 | 66ms | 49ms | 111 | 63 | 51 | 14 |
+| 20 | 101ms | 65ms | 221 | 123 | 101 | 24 |
+
+- 이미지 5장 기준 Prepared statements는 `56 → 33`으로 약 41% 감소했고, transaction은 `26 → 9`로 약 65% 감소했다.
+- 이미지 20장 기준 Prepared statements는 `221 → 123`으로 약 44% 감소했고, transaction은 `101 → 24`로 약 76% 감소했다.
+- 이미지 20장 실행시간은 `101ms → 65ms`로 약 36% 감소했다.
+- 이미지 1장 실행시간은 최종 구조가 더 길다. Copy 전 snapshot 조회와 최종 snapshot 검증의 고정 비용이 있기 때문이다.
+
+최초 구조와 최종 구조의 동일 `100 VU × 이미지 5장 post-only` 결과는 다음과 같다.
+
+| 항목 | 최초 구조 | 최종 구조 |
+| --- | ---: | ---: |
+| Post API 성공 | 18/100 | 100/100 |
+| Post API 실패 | 82/100 | 0/100 |
+| 실패 요청 지연 | 대부분 약 30.15초 후 HTTP 500 | 없음 |
+| 최종 API 평균 응답시간 | 실패가 많아 직접 비교 불가 | 120.60ms |
+| 최종 API p95 | 실패가 많아 직접 비교 불가 | 132.44ms |
+| Image DB 반영 | 정상 완료 불가 | 500/500 |
+| 남은 `PROCESSING` | 발생 | 0 |
+
+최종 구조는 Post/Poll 이미지 작업을 고정 worker 10개의 `postImageExecutor`로 제한하고, 상태 저장을 batch 처리하며, NCP Copy 실행 중 DB transaction을 유지하지 않는다. 이 결과 DB connection pool 고갈과 미완료 상태 방치를 제거했다.
+
+최종 구조의 실제 NCP Copy 자체 속도는 동일 Object Storage benchmark로 다시 측정하지 않았다. 기존 NCP Copy 측정값과 최종 구조를 직접 성능 비교하면 안 된다.
+
 ## 비교 시 주의사항
 
 - 개선 전후 동일한 PostgreSQL, 이미지 수, JVM 상태를 사용한다.

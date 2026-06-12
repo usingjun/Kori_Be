@@ -132,7 +132,7 @@ public class PostImageServiceImpl implements PostImageService {
         );
     }
 
-    @Async("imageExecutor")
+    @Async("postImageExecutor")
     @Override
     public void savePostImages(Long postId, List<String> toAdd) throws BusinessException {
         final List<String> adds = normalizeList(toAdd);
@@ -168,7 +168,7 @@ public class PostImageServiceImpl implements PostImageService {
         }
     }
 
-    @Async("imageExecutor")
+    @Async("postImageExecutor")
     @Override
     public void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove) {
         final List<String> adds = normalizeList(toAdd);

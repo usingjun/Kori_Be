@@ -5,6 +5,8 @@ import core.global.entity.image.entity.ImageOperationStep;
 import core.global.entity.image.repository.ImageOperationRepository;
 import core.global.entity.image.repository.ImageOperationStepRepository;
 import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageOperationStatus;
+import core.global.enums.common.ImageOperationStepStatus;
 import core.global.enums.common.ImageOperationType;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -91,6 +93,20 @@ public class ImageOperationBatchTransactionService {
             skippedStep.markTerminalFailed("Copy batch aborted before execution");
             operationRepository.findById(skippedPlan.operationId()).orElseThrow().markFailed();
         }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void recordCompletionFailure(List<CopyPlan> plans, String errorMessage) {
+        stepRepository.findAllById(plans.stream().map(CopyPlan::stepId).toList()).forEach(step -> {
+            if (step.getStatus() == ImageOperationStepStatus.PROCESSING) {
+                step.markTerminalFailed(errorMessage);
+            }
+        });
+        operationRepository.findAllById(plans.stream().map(CopyPlan::operationId).toList()).forEach(operation -> {
+            if (operation.getStatus() == ImageOperationStatus.PROCESSING) {
+                operation.markFailed();
+            }
+        });
     }
 
     private void completeSteps(List<CopyResult> results) {

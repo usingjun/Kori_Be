@@ -100,6 +100,56 @@ class ImageOperationBatchTransactionServiceTest {
         assertThat(failedOperation.getStatus()).isEqualTo(ImageOperationStatus.FAILED);
     }
 
+    @Test
+    void recordCompletionFailureFailsEveryProcessingStepAndOperation() {
+        ImageOperation firstOperation = processingOperation();
+        ImageOperation secondOperation = processingOperation();
+        ImageOperationStep firstStep = processingStep(firstOperation, "a");
+        ImageOperationStep secondStep = processingStep(secondOperation, "b");
+        List<ImageOperationBatchTransactionService.CopyPlan> plans = List.of(
+                plan(firstOperation, firstStep),
+                plan(secondOperation, secondStep)
+        );
+        when(stepRepository.findAllById(any())).thenReturn(List.of(firstStep, secondStep));
+        when(operationRepository.findAllById(any())).thenReturn(List.of(firstOperation, secondOperation));
+
+        service.recordCompletionFailure(plans, "completion transaction failed");
+
+        assertThat(List.of(firstStep, secondStep))
+                .allMatch(step -> step.getStatus() == ImageOperationStepStatus.FAILED)
+                .allMatch(step -> "completion transaction failed".equals(step.getLastError()));
+        assertThat(List.of(firstOperation, secondOperation))
+                .allMatch(operation -> operation.getStatus() == ImageOperationStatus.FAILED);
+    }
+
+    private ImageOperation processingOperation() {
+        ImageOperation operation = ImageOperation.create(
+                ImageOperationType.CREATE_POST_IMAGES, ImageOperationOwnerType.POST, 10L
+        );
+        operation.markProcessing();
+        return operation;
+    }
+
+    private ImageOperationStep processingStep(ImageOperation operation, String name) {
+        ImageOperationStep step = ImageOperationStep.createCopyStep(
+                operation.getOperationId(), "temp/" + name + ".jpg", "posts/10/" + name + ".jpg", null, null, 5
+        );
+        step.markProcessing();
+        return step;
+    }
+
+    private ImageOperationBatchTransactionService.CopyPlan plan(
+            ImageOperation operation,
+            ImageOperationStep step
+    ) {
+        return new ImageOperationBatchTransactionService.CopyPlan(
+                operation.getOperationId(),
+                step.getStepId(),
+                step.getSourceKey(),
+                step.getTargetKey()
+        );
+    }
+
     @SuppressWarnings({"unchecked", "rawtypes"})
     private ArgumentCaptor<List<ImageOperation>> operationsCaptor() {
         return (ArgumentCaptor) ArgumentCaptor.forClass(List.class);

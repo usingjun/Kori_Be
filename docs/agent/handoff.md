@@ -153,10 +153,9 @@ Domain Service
 
 ### 즉시 이어갈 작업
 
-1. 새 staging manifest로 동일 `100 VU post-only`를 재실행한다.
-2. NCP Copy 전용 제한 병렬 처리 또는 `S3AsyncClient` 적용 여부를 검토한다.
-3. 현재 메모리 기반 `afterCommit` 제출을 durable Outbox로 확장할지 결정한다.
-4. 요청 단위 `ImageOperation` 1개와 이미지별 step 구조로 변경할 때 추가 이득과 compensation/retry/DLQ 의미를 확인한다.
+1. 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 안전한 timeout 복구 정책을 구현한다.
+2. Post/Poll 전체 비동기 작업 요청을 durable Outbox로 저장할지 설계한다.
+3. 2코어·8GB 실제 서버에서 `postImageExecutor` 동시성 10을 재검증한다.
 
 ### 채팅방 프로필 생성 목표
 
@@ -184,11 +183,11 @@ staging Copy
 다음 Codex는 새 구현을 시작하기 전에 아래를 먼저 수행해야 한다.
 
 1. `git status --short`와 `git log -1 --oneline`으로 현재 상태를 확인한다.
-2. `ImageOperationOutboxRelay`의 polling 주기와 Post/Poll Outbox 생성 시점을 확인한다.
-3. 실제 발행·Consumer 완료 시간 측정 방법을 먼저 정한다.
-4. 측정 후 즉시 발행 필요성을 판단하고, 구현 시 polling fallback 경계를 유지한다.
+2. `docs/agent/post-image-update-sequence.md`에서 현재 Post 수정 흐름과 transaction 경계를 확인한다.
+3. 기존에 남은 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 안전한 복구 경계를 확인한다.
+4. timeout 복구 시 Copy만 재시도하지 말고 target object compensation과 상태 종결을 보장한다.
 
-새 작업의 첫 대상은 Post/Poll 이미지 처리의 DB connection/transaction 증폭 개선이다. 측정 근거와 실행 방법은 `docs/agent/image-operation-performance-baseline.md`, `docs/agent/post-image-k6-test-guide.md`를 확인한다.
+최종 재측정에서 API 요청과 실제 이미지 반영은 모두 성공했다. 다음 작업의 첫 대상은 과거 테스트에서 남은 오래된 `PROCESSING` 상태를 안전하게 종결하는 timeout 복구다.
 
 ## 수정하면 안 되는 부분
 
@@ -223,6 +222,18 @@ staging Copy
 
 ## 현재 판단이 필요한 사항
 
+- 최종 구조의 `50 VU`, `100 VU post-only` API 요청은 모두 100% 성공했다.
+- `50 VU`는 Post 50개, Image 250개, Copy step/operation 250개가 모두 완료됐다.
+- `100 VU`는 Post 100개, Image 500개, Copy step/operation 500개가 모두 완료됐다.
+- 두 최종 측정 모두 HTTP 실패, `FAILED`, 남은 `PROCESSING`이 0건이었다.
+- 최초 `100 VU post-only`는 18/100건만 성공하고 82건이 약 30.15초 후 실패했다.
+- DB benchmark 최초 대비 최종 구조는 이미지 5장 transaction이 `26 → 9`, 이미지 20장 transaction이 `101 → 24`로 감소했다.
+- 기존 테스트 데이터에 남은 오래된 `PROCESSING` 상태는 별도 timeout 복구 대상이다.
+- Post/Poll presigned 이미지 작업은 고정 worker 10개, queue 200개의 `postImageExecutor`를 사용한다.
+- `PostImageService`와 `MainContentImageService` 인터페이스의 잔여 `@Transactional`을 제거해 NCP Copy 동안 DB connection이 유지되지 않도록 했다.
+- 프로필 이미지와 관리자 `MultipartFile` Post 업로드는 기존 `imageExecutor`를 사용한다.
+- 전용 실행기 적용 후 50 VU는 Post 50개와 Image 250개, 100 VU는 Post 100개와 Image 500개가 모두 정상 반영됐다.
+- 두 재측정 모두 Copy step/operation이 전부 `COMPLETED`였고 HTTP 실패, `FAILED`, 남은 `PROCESSING`은 0건이었다.
 - 채팅방 삭제는 기존 folder 범위를 유지해 `DELETE_FOLDER`로 처리한다.
 - Outbox 즉시 발행은 지연 개선 목적으로 추가할 수 있지만, polling relay는 유실 복구 fallback으로 유지해야 한다.
 - 다중 서버 Outbox claim은 현재 단일 서버이므로 보류했다. 향후 같은 DB를 공유하는 다중 인스턴스가 생기면 다시 설계해야 한다.
@@ -241,3 +252,12 @@ staging Copy
 - Copy 도중 같은 owner 이미지가 변경되면 최종 snapshot 검증이 실패하고 새 final object를 compensation한다.
 - Post/Poll 이미지 작업은 상위 transaction commit 이후에만 제출된다. rollback 시 작업을 시작하지 않는다.
 - 현재 `afterCommit` 제출은 메모리 callback이므로 commit 직후 서버 종료 시 작업 요청이 유실될 수 있다.
+- 최종 구조의 실제 NCP Copy 자체 속도는 동일 Object Storage benchmark로 아직 재측정하지 않았다.
+
+## 다음 Task 우선순위
+
+1. 현재 미커밋 변경사항을 검토하고 커밋한다.
+2. 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 timeout 복구를 구현한다.
+3. Post/Poll `afterCommit` 메모리 callback을 durable Outbox로 전환할지 설계한다.
+4. 2코어·8GB 실제 서버에서 `postImageExecutor` worker 10개를 검증한다.
+5. 최종 구조의 실제 NCP Copy benchmark와 Outbox 발행 지연을 측정한다.

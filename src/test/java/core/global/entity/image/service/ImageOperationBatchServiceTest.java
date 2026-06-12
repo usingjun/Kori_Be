@@ -205,6 +205,75 @@ class ImageOperationBatchServiceTest {
     }
 
     @Test
+    void copyAllRecordsCompletionFailureAndCompensatesEveryCopiedTarget() {
+        UUID secondOperationId = UUID.randomUUID();
+        UUID secondStepId = UUID.randomUUID();
+        List<ImageOperationBatchService.CopyRequest> requests = List.of(
+                new ImageOperationBatchService.CopyRequest("temp/a.jpg", "posts/10/a.jpg"),
+                new ImageOperationBatchService.CopyRequest("temp/b.jpg", "posts/10/b.jpg")
+        );
+        List<ImageOperationBatchTransactionService.CopyPlan> plans = List.of(
+                new ImageOperationBatchTransactionService.CopyPlan(
+                        operationId, stepId, "temp/a.jpg", "posts/10/a.jpg"
+                ),
+                new ImageOperationBatchTransactionService.CopyPlan(
+                        secondOperationId, secondStepId, "temp/b.jpg", "posts/10/b.jpg"
+                )
+        );
+        when(batchTransactionService.prepareCopies(any(), any(), anyLong(), eq(requests))).thenReturn(plans);
+        when(imageCopyExecutor.copy("temp/a.jpg", "posts/10/a.jpg"))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult("posts/10/a.jpg", "etag-a"));
+        when(imageCopyExecutor.copy("temp/b.jpg", "posts/10/b.jpg"))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult("posts/10/b.jpg", "etag-b"));
+        doThrow(new IllegalStateException("db unavailable"))
+                .when(batchTransactionService)
+                .completeCopies(anyList());
+
+        assertThatThrownBy(() -> batchService.copyAll(
+                ImageOperationType.CREATE_POST_IMAGES,
+                ImageOperationOwnerType.POST,
+                10L,
+                requests
+        ))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("db unavailable");
+
+        verify(batchTransactionService).recordCompletionFailure(plans, "db unavailable");
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, "posts/10/a.jpg");
+        verify(imageOperationRecoveryService).scheduleCompensation(secondOperationId, "posts/10/b.jpg");
+    }
+
+    @Test
+    void copyAllCompensatesWhenCompletionFailureStateCannotBeRecorded() {
+        List<ImageOperationBatchService.CopyRequest> requests = List.of(
+                new ImageOperationBatchService.CopyRequest("temp/a.jpg", "posts/10/a.jpg")
+        );
+        List<ImageOperationBatchTransactionService.CopyPlan> plans = List.of(
+                new ImageOperationBatchTransactionService.CopyPlan(
+                        operationId, stepId, "temp/a.jpg", "posts/10/a.jpg"
+                )
+        );
+        when(batchTransactionService.prepareCopies(any(), any(), anyLong(), eq(requests))).thenReturn(plans);
+        when(imageCopyExecutor.copy("temp/a.jpg", "posts/10/a.jpg"))
+                .thenReturn(new ImageCopyExecutor.ImageCopyResult("posts/10/a.jpg", "etag-a"));
+        doThrow(new IllegalStateException("complete failed"))
+                .when(batchTransactionService)
+                .completeCopies(anyList());
+        doThrow(new IllegalStateException("state db unavailable"))
+                .when(batchTransactionService)
+                .recordCompletionFailure(plans, "complete failed");
+
+        assertThatThrownBy(() -> batchService.copyAll(
+                ImageOperationType.CREATE_POST_IMAGES,
+                ImageOperationOwnerType.POST,
+                10L,
+                requests
+        )).isInstanceOf(IllegalStateException.class);
+
+        verify(imageOperationRecoveryService).scheduleCompensation(operationId, "posts/10/a.jpg");
+    }
+
+    @Test
     void cleanupCreatesDeleteStepsForCopyAndRemovedObject() {
         ImageOperationBatchService.TrackedCopy copy =
                 new ImageOperationBatchService.TrackedCopy(operationId, "temp/a.jpg", "posts/10/a.jpg");

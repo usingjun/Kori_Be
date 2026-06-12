@@ -36,7 +36,7 @@ public class MainContentImageServiceImpl implements MainContentImageService {
     @Value("${cdn.base-url}")
     private String cdnBaseUrl;
 
-    @Async("imageExecutor")
+    @Async("postImageExecutor")
     @Override
     public void upsertPollImages(Long id, List<String> addImageUrls, List<String> removeImages, PollType pollType) {
         final List<String> adds = normalizeList(addImageUrls);

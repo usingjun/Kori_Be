@@ -129,11 +129,11 @@ FailedImageCleanup 저장
 - 측정 방법과 baseline 결과는 `docs/agent/image-operation-performance-baseline.md`에 기록했다.
 - Presign/NCP PUT만 측정하는 `post-image-upload-only-test.js`와 미리 준비된 staging key로 Post API만 측정하는 `post-image-post-only-test.js`를 추가했다.
 - `prepare-post-image-staging.sh`가 post-only 측정용 사용자별 고유 staging object와 manifest를 준비한다.
-- 병목 분리 테스트의 실제 실행 결과는 아직 측정하지 않았다.
+- upload-only와 post-only 병목 분리 테스트를 완료했다.
 - upload-only `100 VU × 이미지 5장`에서 `UPLOAD_BATCH_SIZE=5`는 NCP PUT 497/500개가 timeout 됐고, `UPLOAD_BATCH_SIZE=1`은 500/500개가 성공했다.
 - `UPLOAD_BATCH_SIZE=2`도 500/500개가 성공했지만 업로드 p95는 44.79초로 `UPLOAD_BATCH_SIZE=1`의 20.74초보다 크게 악화됐다.
 - 동시성을 높여도 전체 처리량이 약 51~55MB/s에서 증가하지 않아 단일 부하 발생기 또는 현재 네트워크 경로의 업로드 처리량 포화가 강한 병목 후보다.
-- post-only 측정은 남아 있다.
+- post-only 측정을 완료했고, 최종 구조에서 `50 VU`, `100 VU` 모두 정상 완료를 확인했다.
 - post-only `100 VU × 이미지 5장`에서 Post 생성은 18/100건 성공했고 82건은 약 30.15초 후 HTTP 500으로 실패했다.
 - 동일 `imageExecutor`의 외부 `@Async` 작업과 내부 `CompletableFuture` Copy 중첩, `CallerRunsPolicy`, Hikari 기본 pool 10개, 다수 `REQUIRES_NEW` transaction이 결합된 DB connection pool 고갈이 가장 유력한 병목 후보다.
 - 직접 Hikari timeout 예외는 서버 로그에서 추가 확인해야 한다.
@@ -178,22 +178,49 @@ FailedImageCleanup 저장
 
 ## 현재 진행 중인 작업
 
-- Post/Poll 이미지 작업을 상위 transaction commit 이후에만 비동기 제출하도록 변경했다.
-- 다음 작업은 동일 `100 VU post-only` 테스트로 connection pool 고갈 개선 여부를 재측정하는 것이다.
+- Post/Poll 이미지 구조 개선과 동일 `50 VU`, `100 VU post-only` 최종 재측정을 완료했다.
+- 최종 재측정에서 API 요청, Copy step, operation, Image DB 반영이 모두 성공했다.
+- 현재 구조 개선 변경사항은 아직 커밋하지 않았다.
+- 현재 구현 기준 Post 수정 전체 흐름은 `docs/agent/post-image-update-sequence.md`에 기록했다.
+
+### 최초 구조와 최종 구조 성능 비교
+
+DB benchmark의 최초 구조와 최종 구조 비교:
+
+| 이미지 수 | 최초 statements / transactions | 최종 statements / transactions |
+| ---: | ---: | ---: |
+| 1 | `12 / 6` | `9 / 5` |
+| 5 | `56 / 26` | `33 / 9` |
+| 10 | `111 / 51` | `63 / 14` |
+| 20 | `221 / 101` | `123 / 24` |
+
+- 이미지 5장 기준 statements 약 41%, transactions 약 65% 감소
+- 이미지 20장 기준 statements 약 44%, transactions 약 76% 감소
+
+동일 `100 VU × 이미지 5장 post-only` 최초 구조와 최종 구조 비교:
+
+| 항목 | 최초 구조 | 최종 구조 |
+| --- | ---: | ---: |
+| API 성공 | 18/100 | 100/100 |
+| API 실패 | 82/100 | 0/100 |
+| 최종 평균 / p95 | 비교 불가 | `120.60ms / 132.44ms` |
+| Image DB 반영 | 정상 완료 불가 | 500/500 |
+| 남은 `PROCESSING` | 발생 | 0 |
+
+- 최종 `50 VU × 이미지 5장`도 API 50/50, Image 250/250, step/operation 250/250가 모두 완료됐다.
+- 최종 구조의 실제 NCP Copy 자체 속도는 동일 Object Storage benchmark로 아직 재측정하지 않았다.
 
 ## 남은 작업
 
 ### 가까운 범위
 
-- 동일 조건의 `100 VU post-only` 재측정
-- transaction 경계 분리 후 동일 조건의 `100 VU post-only` 재측정
+- 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` step의 안전한 timeout 복구
 - commit 이후 비동기 제출의 메모리 callback 유실 가능성을 Outbox로 확장할지 검토
-- 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조 검토
-- 2코어·8GB 환경을 고려한 제한된 Consumer/Copy 동시성 설계
+- 2코어·8GB 실제 서버에서 `postImageExecutor` worker 10개 적정성 재검증
+- 최종 구조의 실제 NCP Copy benchmark 재측정
 - 현재 polling 기반 Outbox 처리 지연 측정
 - 측정 결과에 따른 Outbox 발행 지연 개선 여부 결정
 - 직접 업로드 처리 중 서버 종료로 `UPLOAD_OBJECT`가 `PROCESSING`에 남는 경우의 안전한 복구 정책 검토
-- Post/Poll 요청당 Copy 동시성 제한 적용 여부 결정
 - 클라이언트 이미지 업로드 동시성 제한 또는 분산 부하 환경의 추가 검증 여부 결정
 
 ### 다음 확장 범위
@@ -213,10 +240,40 @@ FailedImageCleanup 저장
 
 ## 다음 우선순위 작업
 
-1. 서버를 재시작하고 동일 `100 VU post-only` 테스트로 중첩 executor 제거, batch 상태 저장, transaction 경계 분리 효과를 함께 측정한다.
-2. NCP Copy 전용 제한 병렬 처리 또는 `S3AsyncClient` 적용 여부를 검토한다.
+1. 현재 변경사항을 검토하고 커밋한다.
+2. 기존에 남은 오래된 `COPY_STAGING_TO_FINAL / PROCESSING` 상태의 안전한 timeout 복구를 구현한다.
 3. Post/Poll 전체 비동기 작업 요청을 durable Outbox로 저장할지 설계한다.
-4. 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조의 추가 축소 효과를 검토한다.
-5. 2코어·8GB 서버 기준 Consumer/Copy 동시성 및 Hikari pool 크기를 측정 결과로 결정한다.
+4. 2코어·8GB 실제 서버에서 `postImageExecutor` worker 10개를 재검증한다.
+5. 최종 구조의 실제 NCP Copy benchmark와 Outbox 발행 지연을 측정한다.
+6. 결과에 따라 제한 병렬 Copy, Outbox 즉시 발행 신호 적용 여부를 결정한다.
 
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.
+
+## 현재 구조 개선 체크
+
+| 항목 | 상태 | 현재 결과 |
+| --- | --- | --- |
+| Post/Poll 공통 Operation/Outbox 적용 | 완료 | Copy 추적, compensation, cleanup retry/DLQ 적용 |
+| 동일 `imageExecutor` 중첩 제거 | 완료 | 바깥 `@Async` 유지, 내부 Copy 순차 실행 |
+| operation/step 상태 Batch 저장 | 완료 | 5장 기준 transaction `26 → 8` |
+| NCP Copy와 DB transaction 경계 분리 | 완료 | Copy 실행 중 활성 DB transaction 없음 |
+| 상위 Post/Poll commit 이후 이미지 작업 제출 | 완료 | rollback 시 이미지 작업 미실행 |
+| stale snapshot 검증 | 완료 | Copy 중 동시 수정 발생 시 최종 DB 반영 거부 및 compensation |
+| 동일 `50/100 VU post-only` 재측정 | 완료 | 최종 검증에서 API 100% 성공, Image `250/250`, `500/500` 반영 |
+| 신규 Copy `PROCESSING` 방치 방지 | 완료 | `completeCopies()` 실패 시 전체 plan 실패 기록 및 compensation |
+| Post/Poll 이미지 동시 실행 제한 | 완료 | `postImageExecutor` 고정 worker 10개, queue 200개 |
+| Post/Poll Copy transaction 잔여 제거 | 완료 | 인터페이스의 불필요한 `@Transactional` 제거 |
+| 동시 실행 제한 후 `50/100 VU post-only` 검증 | 완료 | 각각 Image `250/250`, `500/500`, 실패 및 잔여 `PROCESSING` 0 |
+| 기존 Copy `PROCESSING` 방치 복구 | 미완료 | 기존 315개에 대한 timeout 복구 필요 |
+| Copy 제한 병렬 처리 | 검토 대기 | NCP `CopyAll` 미제공, 필요 시 동시성 5~10 검토 |
+| 전체 비동기 작업 요청 durable Outbox | 검토 대기 | 현재 `afterCommit` callback 유실 가능성 존재 |
+
+## 구조 개선 커밋 기준
+
+| 커밋 | 내용 |
+| --- | --- |
+| `7d5ab039` | Post/Poll 이미지 Operation/Outbox 및 compensation 안정화 |
+| `66d92a68` | 동일 `imageExecutor` 중첩 비동기 제거 |
+| `3421eeb6` | 이미지 operation/step 상태 Batch 저장 |
+| `abbfbce5` | NCP Copy와 Image DB transaction 경계 분리 |
+| `b8022509` | 상위 transaction commit 이후 이미지 비동기 작업 제출 |
