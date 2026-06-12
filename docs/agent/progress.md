@@ -86,7 +86,7 @@ FailedImageCleanup 저장
 ### 9. 검증 완료
 
 - 이미지 관련 대상 테스트가 통과했다.
-- 최신 `./scripts/agent-check.sh`는 184개 중 18개가 실패했고, 4개는 skip됐다.
+- 최신 `./scripts/agent-check.sh`는 187개 중 18개가 실패했고, 4개는 skip됐다.
 - 전체 테스트 실패는 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"` 때문이다.
 - 이번 이미지 변경으로 확인된 테스트 실패는 없다.
 
@@ -157,17 +157,27 @@ FailedImageCleanup 저장
 - 이미지 20장은 `221 statements / 101 transactions`에서 `122 statements / 23 transactions`로 감소했다.
 - 바깥 Post/Poll `@Transactional`은 아직 NCP Copy 동안 유지되므로 DB connection 장기 점유 위험은 남아 있다.
 
+### 14. Post/Poll NCP Copy와 DB Transaction 경계 분리
+
+- `PostImageServiceImpl.savePostImages()`, `updatePostImages()`, `MainContentImageServiceImpl.upsertPollImages()`의 메서드 전체 `@Transactional`을 제거했다.
+- `ImagePersistenceTransactionService`가 Copy 전 짧은 조회 transaction과 Copy 후 최종 쓰기 transaction을 담당한다.
+- NCP Copy는 두 transaction 사이에서 실행되어 DB connection을 점유하지 않는다.
+- 최종 쓰기 transaction은 제거 이미지 DB 반영, 생존 이미지 순서 변경, 새 Image 저장, moderation event, cleanup Outbox 저장을 함께 처리한다.
+- Copy 후 최종 저장 전에 현재 이미지 집합이 조회 snapshot과 달라졌으면 stale snapshot으로 판단하고 저장하지 않으며 final object를 compensation한다.
+- 변경 후 DB benchmark는 이미지 5장 `33 statements / 9 transactions`, 20장 `123 statements / 24 transactions`다.
+- 직전 batch 구조보다 조회 transaction과 snapshot 검증 query가 각각 추가됐지만, 긴 Copy 구간을 감싸던 transaction은 제거됐다.
+
 ## 현재 진행 중인 작업
 
-- Post/Poll 이미지별 상태 갱신을 요청 단위 batch transaction으로 축소했다.
-- 다음 작업은 Post/Poll의 바깥 transaction과 NCP Copy 경계를 분리해 Copy 대기 중 DB connection 점유를 제거하는 것이다.
+- Post/Poll의 NCP Copy와 Image DB 저장 transaction 경계를 분리했다.
+- 다음 작업은 동일 `100 VU post-only` 테스트로 connection pool 고갈 개선 여부를 재측정하는 것이다.
 
 ## 남은 작업
 
 ### 가까운 범위
 
 - 동일 조건의 `100 VU post-only` 재측정
-- Post/Poll 바깥 transaction과 NCP Copy orchestration 경계 분리
+- transaction 경계 분리 후 동일 조건의 `100 VU post-only` 재측정
 - 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조 검토
 - 2코어·8GB 환경을 고려한 제한된 Consumer/Copy 동시성 설계
 - 현재 polling 기반 Outbox 처리 지연 측정
@@ -193,8 +203,8 @@ FailedImageCleanup 저장
 
 ## 다음 우선순위 작업
 
-1. 이미지 Copy orchestration과 Image DB 저장 transaction 경계를 분리해 바깥 transaction의 connection 장기 점유를 제거한다.
-2. 서버를 재시작하고 동일 `100 VU post-only` 테스트로 중첩 executor 제거와 batch transaction 효과를 함께 측정한다.
+1. 서버를 재시작하고 동일 `100 VU post-only` 테스트로 중첩 executor 제거, batch 상태 저장, transaction 경계 분리 효과를 함께 측정한다.
+2. NCP Copy 전용 제한 병렬 처리 또는 `S3AsyncClient` 적용 여부를 검토한다.
 3. 요청 단위 `ImageOperation` 1개와 이미지별 `ImageOperationStep` 구조의 추가 축소 효과를 검토한다.
 4. 2코어·8GB 서버 기준 Consumer/Copy 동시성 및 Hikari pool 크기를 측정 결과로 결정한다.
 

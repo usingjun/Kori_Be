@@ -2,6 +2,7 @@ package core.global.entity.image.service.impl;
 
 import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageOperationBatchService;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.enums.PollType;
 import core.global.enums.common.ImageOperationOwnerType;
@@ -33,6 +34,8 @@ class MainContentImageServiceImplTest {
     private ApplicationEventPublisher eventPublisher;
     @Mock
     private ImageOperationBatchService imageOperationBatchService;
+    @Mock
+    private ImagePersistenceTransactionService persistenceTransactionService;
 
     @InjectMocks
     private MainContentImageServiceImpl imageService;
@@ -52,33 +55,39 @@ class MainContentImageServiceImplTest {
 
     @Test
     void upsertPollImagesTracksCopyAndSchedulesCleanup() {
+        when(persistenceTransactionService.loadSnapshot(anyLong(), anyList()))
+                .thenReturn(ImagePersistenceTransactionService.PersistenceSnapshot.empty());
         when(imageOperationBatchService.copyAll(any(), any(), eq(20L), anyList()))
                 .thenReturn(List.of(trackedCopy));
-        when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
 
         imageService.upsertPollImages(20L, List.of("temp/a.jpg"), List.of(), PollType.VOTE);
 
-        verify(imageOperationBatchService).registerRollbackCompensation(List.of(trackedCopy));
-        verify(imageRepository).flush();
-        verify(imageOperationBatchService).scheduleCleanup(
-                ImageOperationOwnerType.POLL, 20L, List.of(trackedCopy), List.of()
+        verify(persistenceTransactionService).persist(
+                eq(ImageOperationOwnerType.POLL),
+                eq(20L),
+                eq(ImagePersistenceTransactionService.PersistenceSnapshot.empty()),
+                anyList(),
+                eq(List.of(trackedCopy))
         );
         verify(storageClient, never()).deleteObjectsBulk(anyList());
     }
 
     @Test
     void upsertPollImagesCompensatesWhenDbFlushFails() {
+        when(persistenceTransactionService.loadSnapshot(anyLong(), anyList()))
+                .thenReturn(ImagePersistenceTransactionService.PersistenceSnapshot.empty());
         when(imageOperationBatchService.copyAll(any(), any(), eq(20L), anyList()))
                 .thenReturn(List.of(trackedCopy));
-        when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
-        doThrow(new DataAccessResourceFailureException("db down")).when(imageRepository).flush();
+        doThrow(new DataAccessResourceFailureException("db down"))
+                .when(persistenceTransactionService)
+                .persist(any(), anyLong(), any(), anyList(), anyList());
 
         assertThatThrownBy(() -> imageService.upsertPollImages(
                 20L, List.of("temp/a.jpg"), List.of(), PollType.VOTE
         )).isInstanceOf(DataAccessResourceFailureException.class);
 
         verify(imageOperationBatchService).compensate(List.of(trackedCopy));
-        verify(imageOperationBatchService, never()).scheduleCleanup(any(), anyLong(), anyList(), anyList());
+        verify(persistenceTransactionService).persist(any(), anyLong(), any(), anyList(), anyList());
     }
 
 }

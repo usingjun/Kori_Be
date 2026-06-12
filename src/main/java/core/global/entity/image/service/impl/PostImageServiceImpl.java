@@ -9,6 +9,7 @@ import core.global.entity.image.entity.Image;
 import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.service.ImageOperationBatchService;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.utils.UrlUtil;
 import core.global.enums.ImageModerationStatus;
@@ -46,6 +47,7 @@ public class PostImageServiceImpl implements PostImageService {
     private final ImageRepository imageRepository;
     private final ImageStorageClient storageClient;
     private final ImageOperationBatchService imageOperationBatchService;
+    private final ImagePersistenceTransactionService persistenceTransactionService;
     private final S3Presigner s3Presigner;
     private final S3Props s3Props;
     private final ApplicationEventPublisher eventPublisher;
@@ -132,13 +134,12 @@ public class PostImageServiceImpl implements PostImageService {
 
     @Async("imageExecutor")
     @Override
-    @Transactional
     public void savePostImages(Long postId, List<String> toAdd) throws BusinessException {
         final List<String> adds = normalizeList(toAdd);
         if (adds.isEmpty()) return;
 
         // 1) 이미지가 존재하면 예외
-        if (imageRepository.existsByImageTypeAndRelatedId(ImageType.POST, postId)) {
+        if (persistenceTransactionService.postImagesExist(postId)) {
             throw new BusinessException(ImageErrorCode.POST_IMAGES_ALREADY_EXIST);
         }
 
@@ -153,19 +154,13 @@ public class PostImageServiceImpl implements PostImageService {
                 0,
                 ImageOperationType.CREATE_POST_IMAGES
         );
-        imageOperationBatchService.registerRollbackCompensation(copyResult.trackedCopies());
-
         try {
-            if (!copyResult.toSave().isEmpty()) {
-                List<Image> savedImages = imageRepository.saveAll(copyResult.toSave());
-                imageRepository.flush();
-                publishModerationEvents(savedImages);
-            }
-            imageOperationBatchService.scheduleCleanup(
+            persistenceTransactionService.persist(
                     ImageOperationOwnerType.POST,
                     postId,
-                    copyResult.trackedCopies(),
-                    List.of()
+                    ImagePersistenceTransactionService.PersistenceSnapshot.empty(),
+                    copyResult.toSave(),
+                    copyResult.trackedCopies()
             );
         } catch (RuntimeException e) {
             imageOperationBatchService.compensate(copyResult.trackedCopies());
@@ -175,21 +170,17 @@ public class PostImageServiceImpl implements PostImageService {
 
     @Async("imageExecutor")
     @Override
-    @Transactional
     public void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove) {
         final List<String> adds = normalizeList(toAdd);
         final List<String> removes = normalizeList(toRemove);
         if (adds.isEmpty() && removes.isEmpty()) return;
 
-        // 1) DB 삭제 + 삭제 대상 키 수집(사용자 제거)
-        List<String> bulkDeleteKeys = deleteRemovedImagesAndCollectKeys(postId, removes);
-
-        // 2) 생존 이미지 조회 + position 재정렬 + 생존 URL 집합 생성
-        SurvivorContext survivorContext = loadAndReorderSurvivors(postId);
+        ImagePersistenceTransactionService.PersistenceSnapshot snapshot =
+                persistenceTransactionService.loadSnapshot(postId, removes);
 
         if (adds.isEmpty()) {
-            imageOperationBatchService.scheduleCleanup(
-                    ImageOperationOwnerType.POST, postId, List.of(), bulkDeleteKeys
+            persistenceTransactionService.persist(
+                    ImageOperationOwnerType.POST, postId, snapshot, List.of(), List.of()
             );
             return;
         }
@@ -201,23 +192,18 @@ public class PostImageServiceImpl implements PostImageService {
                 postId,
                 adds,
                 basePrefix,
-                survivorContext.survivorUrls(),
-                survivorContext.nextPosition(),
+                snapshot.survivorUrls(),
+                snapshot.nextPosition(),
                 ImageOperationType.UPDATE_POST_IMAGES
         );
-        imageOperationBatchService.registerRollbackCompensation(copyResult.trackedCopies());
 
         try {
-            if (!copyResult.toSave().isEmpty()) {
-                List<Image> savedImages = imageRepository.saveAll(copyResult.toSave());
-                imageRepository.flush();
-                publishModerationEvents(savedImages);
-            }
-            imageOperationBatchService.scheduleCleanup(
+            persistenceTransactionService.persist(
                     ImageOperationOwnerType.POST,
                     postId,
-                    copyResult.trackedCopies(),
-                    bulkDeleteKeys
+                    snapshot,
+                    copyResult.toSave(),
+                    copyResult.trackedCopies()
             );
         } catch (RuntimeException e) {
             imageOperationBatchService.compensate(copyResult.trackedCopies());
@@ -421,41 +407,6 @@ public class PostImageServiceImpl implements PostImageService {
         }
     }
 
-    private List<String> deleteRemovedImagesAndCollectKeys(Long postId, List<String> removes) {
-        List<String> bulkDeleteKeys = new ArrayList<>();
-        if (!removes.isEmpty()) {
-            List<String> removeKeys = removes.stream()
-                    .map(raw -> UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, raw))
-                    .toList();
-            List<String> removeUrls = removeKeys.stream()
-                    .map(k -> UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, k))
-                    .toList();
-            imageRepository.deleteByImageTypeAndRelatedIdAndUrlIn(ImageType.POST, postId, removeUrls);
-
-            bulkDeleteKeys.addAll(
-                    removeKeys.stream().filter(k -> !isDefaultUrlOrKey(k)).toList()
-            );
-        }
-        return bulkDeleteKeys;
-    }
-
-    private SurvivorContext loadAndReorderSurvivors(Long postId) {
-        List<Image> survivors = imageRepository
-                .findByImageTypeAndRelatedIdOrderByPositionAsc(ImageType.POST, postId);
-
-        int pos = 0;
-        Set<String> survivorUrls = new HashSet<>();
-        for (Image img : survivors) {
-            img.changePosition(pos++);
-
-            String storedKey = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, img.getUrl());
-            String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, storedKey);
-            survivorUrls.add(finalUrl);
-        }
-
-        return new SurvivorContext(survivors, survivorUrls, pos);
-    }
-
     private boolean isDefaultUrlOrKey(String keyOrUrl) {
         if (keyOrUrl == null || keyOrUrl.isBlank()) return false;
         String k = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, keyOrUrl);
@@ -469,13 +420,6 @@ public class PostImageServiceImpl implements PostImageService {
 
         String basename = srcKey.substring(srcKey.lastIndexOf('/') + 1);
         return "%s/%03d_%s".formatted(base, order, basename);
-    }
-
-    private record SurvivorContext(
-            List<Image> survivors,
-            Set<String> survivorUrls,
-            int nextPosition
-    ) {
     }
 
     private record CopyResult(

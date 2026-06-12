@@ -7,6 +7,7 @@ import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageCopyExecutor;
 import core.global.entity.image.service.ImageOperationBatchService;
 import core.global.entity.image.service.ImageOperationBatchTransactionService;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.entity.image.service.ImageOperationService;
 import core.global.entity.image.service.ImageOperationStepService;
@@ -29,10 +30,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -72,6 +71,7 @@ import static org.mockito.Mockito.when;
         ImageOperationRecoveryService.class,
         ImageOperationBatchService.class,
         ImageOperationBatchTransactionService.class,
+        ImagePersistenceTransactionService.class,
         QuerydslConfig.class,
         PostImageObjectStorageBenchmarkTest.ObjectStorageBenchmarkConfig.class
 })
@@ -93,7 +93,7 @@ class PostImageObjectStorageBenchmarkTest {
     @Autowired
     private EntityManagerFactory entityManagerFactory;
     @Autowired
-    private PlatformTransactionManager transactionManager;
+    private ImagePersistenceTransactionService persistenceTransactionService;
     @Autowired
     private S3Client s3Client;
 
@@ -127,6 +127,7 @@ class PostImageObjectStorageBenchmarkTest {
                 imageRepository,
                 storageClient,
                 batchService,
+                persistenceTransactionService,
                 org.mockito.Mockito.mock(S3Presigner.class),
                 org.mockito.Mockito.mock(S3Props.class),
                 org.mockito.Mockito.mock(ApplicationEventPublisher.class)
@@ -166,9 +167,7 @@ class PostImageObjectStorageBenchmarkTest {
             statistics.clear();
 
             long startedAt = System.nanoTime();
-            new TransactionTemplate(transactionManager).executeWithoutResult(
-                    status -> postImageService.savePostImages(BENCHMARK_POST_ID, stagingKeys)
-            );
+            postImageService.savePostImages(BENCHMARK_POST_ID, stagingKeys);
             long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
 
             System.out.printf(

@@ -7,6 +7,7 @@ import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageCopyExecutor;
 import core.global.entity.image.service.ImageOperationBatchService;
 import core.global.entity.image.service.ImageOperationBatchTransactionService;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.entity.image.service.ImageOperationService;
 import core.global.entity.image.service.ImageOperationStepService;
@@ -27,10 +28,9 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 
@@ -58,6 +58,7 @@ import static org.mockito.Mockito.when;
         ImageOperationRecoveryService.class,
         ImageOperationBatchService.class,
         ImageOperationBatchTransactionService.class,
+        ImagePersistenceTransactionService.class,
         QuerydslConfig.class
 })
 class PostImageServiceDbBenchmarkTest {
@@ -74,7 +75,7 @@ class PostImageServiceDbBenchmarkTest {
     @Autowired
     private ImageRepository imageRepository;
     @Autowired
-    private PlatformTransactionManager transactionManager;
+    private ImagePersistenceTransactionService persistenceTransactionService;
 
     @MockitoBean
     private ImageCopyExecutor imageCopyExecutor;
@@ -95,10 +96,13 @@ class PostImageServiceDbBenchmarkTest {
         statistics.setStatisticsEnabled(true);
 
         when(imageCopyExecutor.copy(anyString(), anyString()))
-                .thenAnswer(invocation -> new ImageCopyExecutor.ImageCopyResult(
-                        invocation.getArgument(1),
-                        "benchmark-etag"
-                ));
+                .thenAnswer(invocation -> {
+                    assertThat(TransactionSynchronizationManager.isActualTransactionActive()).isFalse();
+                    return new ImageCopyExecutor.ImageCopyResult(
+                            invocation.getArgument(1),
+                            "benchmark-etag"
+                    );
+                });
         when(storageClient.isStagingKey(anyString())).thenReturn(true);
         when(storageClient.isDefaultUrlOrKey(anyString())).thenReturn(false);
 
@@ -107,6 +111,7 @@ class PostImageServiceDbBenchmarkTest {
                 imageRepository,
                 storageClient,
                 batchService,
+                persistenceTransactionService,
                 org.mockito.Mockito.mock(S3Presigner.class),
                 org.mockito.Mockito.mock(S3Props.class),
                 org.mockito.Mockito.mock(ApplicationEventPublisher.class)
@@ -136,9 +141,7 @@ class PostImageServiceDbBenchmarkTest {
                     .toList();
 
             long startedAt = System.nanoTime();
-            new TransactionTemplate(transactionManager).executeWithoutResult(
-                    status -> postImageService.savePostImages(BENCHMARK_POST_ID, stagingKeys)
-            );
+            postImageService.savePostImages(BENCHMARK_POST_ID, stagingKeys);
             long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
 
             System.out.printf(

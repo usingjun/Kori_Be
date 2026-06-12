@@ -459,6 +459,29 @@ transaction 증가식은 `5 × 이미지 수 + 1`에서 대략 `이미지 수 + 
 
 이번 변경은 이미지별 상태 갱신 transaction 증폭을 줄였지만, Post/Poll 서비스 바깥 `@Transactional`은 여전히 NCP Copy 동안 유지된다. 따라서 Copy 대기 중 DB connection 장기 점유를 제거하려면 Copy orchestration과 Image DB 저장 transaction 경계를 추가로 분리해야 한다.
 
+### NCP Copy와 Image DB Transaction 경계 분리 후 DB benchmark
+
+Post/Poll orchestration 전체의 `@Transactional`을 제거하고 다음 경계로 분리했다.
+
+```text
+짧은 Image snapshot 조회 transaction
+→ transaction 없이 NCP Copy
+→ 짧은 Image 저장 + cleanup Outbox transaction
+```
+
+2026-06-12 `PostImageServiceDbBenchmarkTest` 결과:
+
+| 이미지 수 | 실행시간 | Prepared statements | Hibernate transactions |
+| ---: | ---: | ---: | ---: |
+| 1 | 140ms | 9 | 5 |
+| 5 | 33ms | 33 | 9 |
+| 10 | 49ms | 63 | 14 |
+| 20 | 65ms | 123 | 24 |
+
+직전 batch 상태 저장 구조보다 prepared statement와 transaction이 각각 고정 1개 증가했다. Copy 전 snapshot 조회와 최종 snapshot 유효성 검증 비용이다.
+
+이 변경의 목적은 총 transaction 수를 한 개 더 줄이는 것이 아니라, 외부 NCP Copy 실행시간 동안 DB transaction과 connection을 점유하지 않는 것이다. Benchmark의 mock `ImageCopyExecutor` 실행 시 실제 transaction이 활성화되지 않았음을 함께 검증한다.
+
 ### 개선 판단 기준
 
 - 실제 API 응답시간이 요구사항을 만족하면 현재 구조를 유지하고 관찰한다.

@@ -3,6 +3,7 @@ package core.global.entity.image.service.impl;
 import core.global.entity.image.S3Props;
 import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageOperationBatchService;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.enums.common.ImageOperationOwnerType;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,6 +42,8 @@ class PostImageServiceImplTest {
     private ApplicationEventPublisher eventPublisher;
     @Mock
     private ImageOperationBatchService imageOperationBatchService;
+    @Mock
+    private ImagePersistenceTransactionService persistenceTransactionService;
 
     @InjectMocks
     private PostImageServiceImpl postImageService;
@@ -60,64 +63,72 @@ class PostImageServiceImplTest {
 
     @Test
     void savePostImagesTracksCopyAndSchedulesStagingCleanup() {
-        when(imageRepository.existsByImageTypeAndRelatedId(any(), eq(10L))).thenReturn(false);
+        when(persistenceTransactionService.postImagesExist(10L)).thenReturn(false);
         when(imageOperationBatchService.copyAll(any(), any(), eq(10L), anyList()))
                 .thenReturn(List.of(trackedCopy));
-        when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
 
         postImageService.savePostImages(10L, List.of("temp/a.jpg"));
 
-        verify(imageOperationBatchService).registerRollbackCompensation(List.of(trackedCopy));
-        verify(imageRepository).flush();
-        verify(imageOperationBatchService).scheduleCleanup(
-                ImageOperationOwnerType.POST, 10L, List.of(trackedCopy), List.of()
+        verify(persistenceTransactionService).persist(
+                eq(ImageOperationOwnerType.POST),
+                eq(10L),
+                eq(ImagePersistenceTransactionService.PersistenceSnapshot.empty()),
+                anyList(),
+                eq(List.of(trackedCopy))
         );
         verify(storageClient, never()).deleteObjectsBulk(anyList());
     }
 
     @Test
     void updatePostImagesSchedulesRemovedObjectCleanupWithoutDirectDelete() {
+        ImagePersistenceTransactionService.PersistenceSnapshot snapshot =
+                new ImagePersistenceTransactionService.PersistenceSnapshot(
+                        List.of("https://cdn.example.com/posts/10/old.jpg"),
+                        List.of("posts/10/old.jpg"),
+                        java.util.Set.of(),
+                        0
+                );
+        when(persistenceTransactionService.loadSnapshot(anyLong(), anyList())).thenReturn(snapshot);
+
         postImageService.updatePostImages(
                 10L,
                 List.of(),
                 List.of("https://cdn.example.com/posts/10/old.jpg")
         );
 
-        verify(imageOperationBatchService).scheduleCleanup(
-                ImageOperationOwnerType.POST,
-                10L,
-                List.of(),
-                List.of("posts/10/old.jpg")
+        verify(persistenceTransactionService).persist(
+                ImageOperationOwnerType.POST, 10L, snapshot, List.of(), List.of()
         );
         verify(storageClient, never()).deleteObjectsBulk(anyList());
     }
 
     @Test
     void savePostImagesCompensatesWhenDbFlushFails() {
-        when(imageRepository.existsByImageTypeAndRelatedId(any(), eq(10L))).thenReturn(false);
+        when(persistenceTransactionService.postImagesExist(10L)).thenReturn(false);
         when(imageOperationBatchService.copyAll(any(), any(), eq(10L), anyList()))
                 .thenReturn(List.of(trackedCopy));
-        when(imageRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
-        doThrow(new DataAccessResourceFailureException("db down")).when(imageRepository).flush();
+        doThrow(new DataAccessResourceFailureException("db down"))
+                .when(persistenceTransactionService)
+                .persist(any(), anyLong(), any(), anyList(), anyList());
 
         assertThatThrownBy(() -> postImageService.savePostImages(10L, List.of("temp/a.jpg")))
                 .isInstanceOf(DataAccessResourceFailureException.class);
 
         verify(imageOperationBatchService).compensate(List.of(trackedCopy));
-        verify(imageOperationBatchService, never()).scheduleCleanup(any(), anyLong(), anyList(), anyList());
+        verify(persistenceTransactionService).persist(any(), anyLong(), any(), anyList(), anyList());
     }
 
     @Test
     void savePostImagesCompensatesSuccessfulCopiesWhenAnotherCopyFails() {
         lenient().when(storageClient.isStagingKey("temp/b.jpg")).thenReturn(true);
-        when(imageRepository.existsByImageTypeAndRelatedId(any(), eq(10L))).thenReturn(false);
+        when(persistenceTransactionService.postImagesExist(10L)).thenReturn(false);
         when(imageOperationBatchService.copyAll(any(), any(), eq(10L), anyList()))
                 .thenThrow(new IllegalStateException("copy failed"));
 
         assertThatThrownBy(() -> postImageService.savePostImages(10L, List.of("temp/a.jpg", "temp/b.jpg")))
                 .isInstanceOf(core.global.exception.BusinessException.class);
 
-        verify(imageRepository, never()).saveAll(anyList());
+        verify(persistenceTransactionService, never()).persist(any(), anyLong(), any(), anyList(), anyList());
     }
 
 }

@@ -434,3 +434,29 @@ Spring Data JPA는 assigned ID entity에서 nullable `@Version`을 신규 여부
 - Copy 실패 상태 기록이 실패해도 destination object compensation은 실행해야 한다.
 - 미실행 Copy destination은 compensation하지 않는다.
 - 현재 바깥 Post/Poll `@Transactional`은 Copy 동안 유지되므로 DB connection 장기 점유 문제는 별도 개선해야 한다.
+
+## 20. Post/Poll NCP Copy는 DB transaction 밖에서 실행한다
+
+### 결정
+
+- Post/Poll 이미지 orchestration 메서드 전체를 감싸던 `@Transactional`을 제거한다.
+- Copy 전 현재 Image 상태는 짧은 read-only transaction에서 snapshot으로 조회한다.
+- NCP Copy는 transaction 없이 실행한다.
+- Copy 성공 후 제거·재정렬·Image 저장·cleanup Outbox 저장은 하나의 짧은 쓰기 transaction에서 처리한다.
+- 최종 쓰기 전 현재 Image 집합이 snapshot과 다르면 저장을 거부하고 Copy 결과를 compensation한다.
+
+### 이유
+
+NCP Copy는 외부 I/O이므로 실행시간 동안 DB connection을 점유할 필요가 없다. 기존 구조는 Copy 지연이 Hikari connection 점유 시간으로 이어져 동시 요청에서 pool 고갈 가능성을 높였다.
+
+### 채택하지 않은 대안
+
+- Hikari pool만 확대
+- transaction 안에서 NCP Copy 유지
+- snapshot 검증 없이 조회와 쓰기 transaction을 단순 분리
+
+### 변경 시 주의
+
+- transaction 수 자체는 짧은 조회 transaction 때문에 직전 구조보다 1개 증가한다. 목표는 transaction 개수 최소화가 아니라 외부 I/O 동안 connection 점유 제거다.
+- 같은 owner의 이미지 요청이 Copy 중간에 변경되면 stale snapshot 오류와 compensation이 발생할 수 있다.
+- snapshot 검증을 제거하면 동시 수정 시 이미지 순서와 제거 대상 정합성이 깨질 수 있다.

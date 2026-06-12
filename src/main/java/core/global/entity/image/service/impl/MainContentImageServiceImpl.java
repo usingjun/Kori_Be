@@ -1,9 +1,8 @@
 package core.global.entity.image.service.impl;
 
-import core.global.entity.image.dto.ImageModerationEvent;
 import core.global.entity.image.entity.Image;
-import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageOperationBatchService;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.utils.UrlUtil;
 import core.global.enums.ImageModerationStatus;
@@ -13,11 +12,9 @@ import core.global.enums.common.ImageOperationType;
 import core.global.enums.common.ImageType;
 import core.global.enums.errorcode.ImageErrorCode;
 import core.global.exception.BusinessException;
-import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
@@ -28,10 +25,9 @@ import java.util.*;
 @RequiredArgsConstructor
 public class MainContentImageServiceImpl implements MainContentImageService {
 
-    private final ImageRepository imageRepository;
     private final ImageStorageClient storageClient;
     private final ImageOperationBatchService imageOperationBatchService;
-    private final ApplicationEventPublisher eventPublisher;
+    private final ImagePersistenceTransactionService persistenceTransactionService;
 
     @Value("${ncp.s3.bucket}")
     private String bucket;
@@ -41,7 +37,6 @@ public class MainContentImageServiceImpl implements MainContentImageService {
     private String cdnBaseUrl;
 
     @Async("imageExecutor")
-    @Transactional
     @Override
     public void upsertPollImages(Long id, List<String> addImageUrls, List<String> removeImages, PollType pollType) {
         final List<String> adds = normalizeList(addImageUrls);
@@ -50,16 +45,12 @@ public class MainContentImageServiceImpl implements MainContentImageService {
         // 변경사항이 없으면 종료
         if (adds.isEmpty() && removes.isEmpty()) return;
 
-        // 1) [DB 삭제] 사용자 제거 요청 처리 + S3 삭제 키 수집
-        List<String> bulkDeleteKeys = deleteRemovedImagesAndCollectKeys(id, removes);
+        ImagePersistenceTransactionService.PersistenceSnapshot snapshot =
+                persistenceTransactionService.loadSnapshot(id, removes);
 
-        // 2) [생존 조회] DB에 남은 이미지 조회 + Position 재정렬(0부터) + 중복 방지용 URL 집합 생성
-        SurvivorContext survivorContext = loadAndReorderSurvivors(id);
-
-        // 추가할 이미지가 없다면 여기서 S3 삭제 처리 후 종료
         if (adds.isEmpty()) {
-            imageOperationBatchService.scheduleCleanup(
-                    ImageOperationOwnerType.POLL, id, List.of(), bulkDeleteKeys
+            persistenceTransactionService.persist(
+                    ImageOperationOwnerType.POLL, id, snapshot, List.of(), List.of()
             );
             return;
         }
@@ -70,34 +61,21 @@ public class MainContentImageServiceImpl implements MainContentImageService {
                 id,
                 adds,
                 basePrefix,
-                survivorContext.survivorUrls(),
-                survivorContext.nextPosition()
+                snapshot.survivorUrls(),
+                snapshot.nextPosition()
         );
-        imageOperationBatchService.registerRollbackCompensation(copyResult.trackedCopies());
 
         try {
-            if (!copyResult.toSave().isEmpty()) {
-                List<Image> savedImages = imageRepository.saveAll(copyResult.toSave());
-                imageRepository.flush();
-                publishModerationEvents(savedImages);
-            }
-            imageOperationBatchService.scheduleCleanup(
+            persistenceTransactionService.persist(
                     ImageOperationOwnerType.POLL,
                     id,
-                    copyResult.trackedCopies(),
-                    bulkDeleteKeys
+                    snapshot,
+                    copyResult.toSave(),
+                    copyResult.trackedCopies()
             );
         } catch (RuntimeException e) {
             imageOperationBatchService.compensate(copyResult.trackedCopies());
             throw e;
-        }
-    }
-
-
-    private void publishModerationEvents(List<Image> savedImages) {
-        for (Image img : savedImages) {
-            String key = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, img.getUrl());
-            eventPublisher.publishEvent(new ImageModerationEvent(img.getId(), key));
         }
     }
 
@@ -166,41 +144,6 @@ public class MainContentImageServiceImpl implements MainContentImageService {
         }
     }
 
-    private List<String> deleteRemovedImagesAndCollectKeys(Long postId, List<String> removes) {
-        List<String> bulkDeleteKeys = new ArrayList<>();
-        if (!removes.isEmpty()) {
-            List<String> removeKeys = removes.stream()
-                    .map(raw -> UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, raw))
-                    .toList();
-            List<String> removeUrls = removeKeys.stream()
-                    .map(k -> UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, k))
-                    .toList();
-            imageRepository.deleteByImageTypeAndRelatedIdAndUrlIn(ImageType.POST, postId, removeUrls);
-
-            bulkDeleteKeys.addAll(
-                    removeKeys.stream().filter(k -> !isDefaultUrlOrKey(k)).toList()
-            );
-        }
-        return bulkDeleteKeys;
-    }
-
-    private SurvivorContext loadAndReorderSurvivors(Long postId) {
-        List<Image> survivors = imageRepository
-                .findByImageTypeAndRelatedIdOrderByPositionAsc(ImageType.POST, postId);
-
-        int pos = 0;
-        Set<String> survivorUrls = new HashSet<>();
-        for (Image img : survivors) {
-            img.changePosition(pos++);
-
-            String storedKey = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, img.getUrl());
-            String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, storedKey);
-            survivorUrls.add(finalUrl);
-        }
-
-        return new SurvivorContext(survivors, survivorUrls, pos);
-    }
-
     private boolean isDefaultUrlOrKey(String keyOrUrl) {
         if (keyOrUrl == null || keyOrUrl.isBlank()) return false;
         String k = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, keyOrUrl);
@@ -214,13 +157,6 @@ public class MainContentImageServiceImpl implements MainContentImageService {
 
         String basename = srcKey.substring(srcKey.lastIndexOf('/') + 1);
         return "%s/%03d_%s".formatted(base, order, basename);
-    }
-
-    private record SurvivorContext(
-            List<Image> survivors,
-            Set<String> survivorUrls,
-            int nextPosition
-    ) {
     }
 
     private record CopyResult(
