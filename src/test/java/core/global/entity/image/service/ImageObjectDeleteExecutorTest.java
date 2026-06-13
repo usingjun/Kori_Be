@@ -1,5 +1,6 @@
 package core.global.entity.image.service;
 
+import core.global.entity.image.repository.ImageRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -20,6 +21,8 @@ class ImageObjectDeleteExecutorTest {
     private S3Client s3Client;
     @Mock
     private ImageStorageClient storageClient;
+    @Mock
+    private ImageRepository imageRepository;
 
     @InjectMocks
     private ImageObjectDeleteExecutor executor;
@@ -33,6 +36,8 @@ class ImageObjectDeleteExecutorTest {
     void deleteObject_deletesNonDefaultObject() {
         DeleteObjectResponse response = mock(DeleteObjectResponse.class);
         when(storageClient.isDefaultUrlOrKey("users/10/profile.jpg")).thenReturn(false);
+        when(storageClient.generatePublicUrl("users/10/profile.jpg"))
+                .thenReturn("https://cdn.example.com/users/10/profile.jpg");
         when(s3Client.deleteObject(any(java.util.function.Consumer.class))).thenReturn(response);
         when(response.sdkHttpResponse()).thenReturn(
                 software.amazon.awssdk.http.SdkHttpResponse.builder().statusCode(204).build()
@@ -48,6 +53,18 @@ class ImageObjectDeleteExecutorTest {
         when(storageClient.isDefaultUrlOrKey("default/profile.jpg")).thenReturn(true);
 
         executor.deleteObject("default/profile.jpg");
+
+        verifyNoInteractions(s3Client);
+    }
+
+    @Test
+    void deleteObject_skipsObjectRegisteredAfterCleanupWasScheduled() {
+        when(storageClient.isDefaultUrlOrKey("posts/objects/a.jpg")).thenReturn(false);
+        when(storageClient.generatePublicUrl("posts/objects/a.jpg"))
+                .thenReturn("https://cdn.example.com/posts/objects/a.jpg");
+        when(imageRepository.existsByUrl("https://cdn.example.com/posts/objects/a.jpg")).thenReturn(true);
+
+        executor.deleteObject("posts/objects/a.jpg");
 
         verifyNoInteractions(s3Client);
     }

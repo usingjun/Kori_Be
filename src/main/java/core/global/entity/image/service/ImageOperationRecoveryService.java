@@ -20,8 +20,10 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 @Service
@@ -31,6 +33,7 @@ public class ImageOperationRecoveryService {
     private static final String CONSUMER_NAME = "image-operation-step-consumer";
     private static final int DEFAULT_COMPENSATION_MAX_ATTEMPTS = 5;
     private static final int DEFAULT_CLEANUP_MAX_ATTEMPTS = 5;
+    private static final long SYSTEM_OWNER_ID = 0L;
     private static final List<ImageOperationStepType> RECOVERABLE_DELETE_STEP_TYPES = List.of(
             ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
             ImageOperationStepType.DELETE_STAGING,
@@ -143,6 +146,52 @@ public class ImageOperationRecoveryService {
         );
         outboxRepository.save(outbox(step, 0, ImageOperationMessageDestination.INITIAL));
         return operation.getOperationId();
+    }
+
+    @Transactional
+    public int scheduleUnregisteredPostObjectDeletes(List<String> targetKeys) {
+        List<String> cleanupKeys = targetKeys.stream()
+                .filter(key -> key != null && key.startsWith("posts/objects/"))
+                .distinct()
+                .toList();
+        if (cleanupKeys.isEmpty()) {
+            return 0;
+        }
+
+        Set<String> alreadyTracked = new HashSet<>(
+                stepRepository.findByStepTypeAndTargetKeyIn(
+                                ImageOperationStepType.DELETE_OBJECT,
+                                cleanupKeys
+                        ).stream()
+                        .map(ImageOperationStep::getTargetKey)
+                        .toList()
+        );
+        List<String> newCleanupKeys = cleanupKeys.stream()
+                .filter(key -> !alreadyTracked.contains(key))
+                .toList();
+        if (newCleanupKeys.isEmpty()) {
+            return 0;
+        }
+
+        ImageOperation operation = operationRepository.save(
+                ImageOperation.create(
+                        ImageOperationType.CLEANUP_ONLY,
+                        ImageOperationOwnerType.SYSTEM,
+                        SYSTEM_OWNER_ID
+                )
+        );
+        operation.markProcessing();
+        for (String targetKey : newCleanupKeys) {
+            ImageOperationStep step = stepRepository.save(
+                    ImageOperationStep.createDeleteObjectStep(
+                            operation.getOperationId(),
+                            targetKey,
+                            DEFAULT_CLEANUP_MAX_ATTEMPTS
+                    )
+            );
+            outboxRepository.save(outbox(step, 0, ImageOperationMessageDestination.INITIAL));
+        }
+        return newCleanupKeys.size();
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)

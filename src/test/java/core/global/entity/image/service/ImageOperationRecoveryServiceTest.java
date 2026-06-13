@@ -171,6 +171,36 @@ class ImageOperationRecoveryServiceTest {
     }
 
     @Test
+    @DisplayName("미등록 Post object는 기존 삭제 step이 없는 key만 cleanup Outbox로 예약한다")
+    void scheduleUnregisteredPostObjectDeletes_skipsAlreadyTrackedKeys() {
+        ImageOperationStep tracked = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "posts/objects/tracked.jpg",
+                5
+        );
+        when(stepRepository.findByStepTypeAndTargetKeyIn(
+                ImageOperationStepType.DELETE_OBJECT,
+                List.of("posts/objects/tracked.jpg", "posts/objects/new.jpg")
+        )).thenReturn(List.of(tracked));
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        int scheduled = recoveryService.scheduleUnregisteredPostObjectDeletes(
+                List.of("posts/objects/tracked.jpg", "posts/objects/new.jpg", "temp/ignored.jpg")
+        );
+
+        assertThat(scheduled).isEqualTo(1);
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        verify(stepRepository).save(stepCaptor.capture());
+        verify(outboxRepository).save(any());
+        assertThat(operationCaptor.getValue().getOwnerType()).isEqualTo(ImageOperationOwnerType.SYSTEM);
+        assertThat(operationCaptor.getValue().getOwnerId()).isZero();
+        assertThat(stepCaptor.getValue().getTargetKey()).isEqualTo("posts/objects/new.jpg");
+    }
+
+    @Test
     @DisplayName("DELETE_FOLDER cleanup operation과 초기 Outbox를 생성한다")
     void scheduleDeleteFolder_createsCleanupOperation() {
         when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));

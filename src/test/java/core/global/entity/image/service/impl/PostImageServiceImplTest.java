@@ -1,11 +1,16 @@
 package core.global.entity.image.service.impl;
 
 import core.global.entity.image.S3Props;
+import core.global.config.CustomUserDetails;
+import core.global.entity.image.dto.PresignedUrlRequest;
 import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageOperationBatchService;
 import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.ImageStorageClient;
+import core.global.entity.image.service.ImageUploadSessionService;
 import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageType;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -14,10 +19,15 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.util.ReflectionTestUtils;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.presigner.model.PresignedPutObjectRequest;
 
+import java.net.URL;
 import java.util.List;
 import java.util.UUID;
 
@@ -44,6 +54,8 @@ class PostImageServiceImplTest {
     private ImageOperationBatchService imageOperationBatchService;
     @Mock
     private ImagePersistenceTransactionService persistenceTransactionService;
+    @Mock
+    private ImageUploadSessionService uploadSessionService;
 
     @InjectMocks
     private PostImageServiceImpl postImageService;
@@ -58,6 +70,37 @@ class PostImageServiceImplTest {
         lenient().when(storageClient.isStagingKey("temp/a.jpg")).thenReturn(true);
         trackedCopy = new ImageOperationBatchService.TrackedCopy(
                 UUID.randomUUID(), "temp/a.jpg", "posts/10/000_a.jpg"
+        );
+    }
+
+    @AfterEach
+    void tearDown() {
+        SecurityContextHolder.clearContext();
+    }
+
+    @Test
+    void generatePresignedUrls_issuesUploadSessionForPostFinalKey() throws Exception {
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken(
+                        new CustomUserDetails(10L, "owner@example.com", List.of(new SimpleGrantedAuthority("USER"))),
+                        "password"
+                )
+        );
+        PresignedPutObjectRequest presigned = mock(PresignedPutObjectRequest.class);
+        when(presigned.url()).thenReturn(new URL("https://object.example.com/upload"));
+        when(s3Presigner.presignPutObject(any(software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest.class)))
+                .thenReturn(presigned);
+
+        var result = postImageService.generatePresignedUrls(new PresignedUrlRequest(
+                ImageType.POST,
+                "session-id",
+                List.of(new PresignedUrlRequest.FileSpec("photo.jpg", "image/jpeg"))
+        ));
+
+        verify(uploadSessionService).issue(
+                eq(result.get(0).key()),
+                eq(10L),
+                eq(ImageType.POST)
         );
     }
 

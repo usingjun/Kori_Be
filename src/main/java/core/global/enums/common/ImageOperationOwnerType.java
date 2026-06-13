@@ -5,5 +5,6 @@ public enum ImageOperationOwnerType {
     CHAT_ROOM,
     POST,
     POLL,
-    IMAGE
+    IMAGE,
+    SYSTEM
 }

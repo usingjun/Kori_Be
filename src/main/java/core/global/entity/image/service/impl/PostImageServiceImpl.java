@@ -10,8 +10,10 @@ import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.service.ImageOperationBatchService;
 import core.global.entity.image.service.ImagePersistenceTransactionService;
+import core.global.entity.image.service.ImageUploadSessionService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.utils.UrlUtil;
+import core.global.config.CustomUserDetails;
 import core.global.enums.ImageModerationStatus;
 import core.global.enums.common.ImageOperationOwnerType;
 import core.global.enums.common.ImageOperationType;
@@ -48,6 +50,7 @@ public class PostImageServiceImpl implements PostImageService {
     private final ImageStorageClient storageClient;
     private final ImageOperationBatchService imageOperationBatchService;
     private final ImagePersistenceTransactionService persistenceTransactionService;
+    private final ImageUploadSessionService uploadSessionService;
     private final S3Presigner s3Presigner;
     private final S3Props s3Props;
     private final ApplicationEventPublisher eventPublisher;
@@ -63,8 +66,10 @@ public class PostImageServiceImpl implements PostImageService {
      * ✅ Presigned URL 생성 (일괄)
      */
     @Override
+    @org.springframework.transaction.annotation.Transactional
     public List<PresignedUrlResponse> generatePresignedUrls(PresignedUrlRequest request) {
         String email = SecurityContextHolder.getContext().getAuthentication().getName();
+        Long ownerId = currentUserId();
 
         if (request.files() == null || request.files().isEmpty()) {
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
@@ -76,12 +81,13 @@ public class PostImageServiceImpl implements PostImageService {
 
         List<PresignedUrlResponse> out = new ArrayList<>(request.files().size());
         for (PresignedUrlRequest.FileSpec f : request.files()) {
-            out.add(generateOne(email, request.imageType(), request.uploadSessionId(), f));
+            out.add(generateOne(ownerId, email, request.imageType(), request.uploadSessionId(), f));
         }
         return out;
     }
 
     private PresignedUrlResponse generateOne(
+            Long ownerId,
             String email,
             ImageType imageType,
             String uploadSessionId,
@@ -92,7 +98,9 @@ public class PostImageServiceImpl implements PostImageService {
                 ? "image/jpeg"
                 : fileSpec.contentType();
 
-        String key = UrlUtil.buildRawKey(email, imageType, uploadSessionId, filename);
+        String key = imageType == ImageType.POST
+                ? UrlUtil.buildPostFinalKey(filename)
+                : UrlUtil.buildRawKey(email, imageType, uploadSessionId, filename);
 
         // 서명에 포함할 메타데이터
         Map<String, String> meta = Map.of(
@@ -123,6 +131,9 @@ public class PostImageServiceImpl implements PostImageService {
         clientHeaders.put("x-amz-meta-image-type", imageType.name().toLowerCase());
 
         String publicUrl = UrlUtil.buildPublicUrlFromKey(endPoint, bucket, key);
+        if (imageType == ImageType.POST) {
+            uploadSessionService.issue(key, ownerId, imageType);
+        }
 
         return new PresignedUrlResponse(
                 key,
@@ -130,6 +141,14 @@ public class PostImageServiceImpl implements PostImageService {
                 "PUT",
                 clientHeaders
         );
+    }
+
+    private Long currentUserId() {
+        Object principal = SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        if (principal instanceof CustomUserDetails userDetails) {
+            return userDetails.getUserId();
+        }
+        throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
     }
 
     @Async("postImageExecutor")

@@ -125,6 +125,11 @@ public interface ImageRepository extends JpaRepository<Image, Long> {
 
     boolean existsByImageTypeAndRelatedIdAndUrl(ImageType imageType, Long relatedId, String url);
 
+    boolean existsByUrl(String url);
+
+    @Query("select i.url from Image i where i.url in :urls")
+    List<String> findRegisteredUrls(@Param("urls") Collection<String> urls);
+
     @Query("SELECT i.relatedId, i.url FROM Image i " +
            "WHERE i.id IN (SELECT MIN(i2.id) FROM Image i2 " +
            "               WHERE i2.relatedId IN :postIds AND i2.imageType = 'POST' " +

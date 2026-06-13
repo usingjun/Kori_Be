@@ -94,6 +94,8 @@ class PostImageObjectStorageBenchmarkTest {
     private EntityManagerFactory entityManagerFactory;
     @Autowired
     private ImagePersistenceTransactionService persistenceTransactionService;
+    @org.springframework.test.context.bean.override.mockito.MockitoBean
+    private core.global.entity.image.service.ImageUploadSessionService imageUploadSessionService;
     @Autowired
     private S3Client s3Client;
 
@@ -128,6 +130,7 @@ class PostImageObjectStorageBenchmarkTest {
                 storageClient,
                 batchService,
                 persistenceTransactionService,
+                org.mockito.Mockito.mock(core.global.entity.image.service.ImageUploadSessionService.class),
                 org.mockito.Mockito.mock(S3Presigner.class),
                 org.mockito.Mockito.mock(S3Props.class),
                 org.mockito.Mockito.mock(ApplicationEventPublisher.class)

@@ -6,6 +6,7 @@ import core.global.entity.image.dto.PresignedUrlRequest;
 import core.global.entity.image.dto.PresignedUrlResponse;
 import core.global.entity.image.service.ImageService;
 import core.global.entity.image.service.ImageStorageClient;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.PostImageOperationPipelineService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.service.ProfileImageService;
@@ -30,6 +31,7 @@ public class ImageServiceImpl implements ImageService {
     private final ImageStorageClient imageStorageClient;
     private final MainContentImageService mainContentImageService;
     private final PostImageOperationPipelineService postImageOperationPipelineService;
+    private final ImagePersistenceTransactionService imagePersistenceTransactionService;
 
     @Value("${image.cleanup.rabbit.enabled:false}")
     private boolean imageOperationRabbitEnabled;
@@ -42,6 +44,10 @@ public class ImageServiceImpl implements ImageService {
     @Override
     public void savePostImages(Long postId, List<String> toAdd) {
         List<String> adds = copyNullableList(toAdd);
+        if (usesFinalPostKeys(adds)) {
+            imagePersistenceTransactionService.saveFinalPostImages(postId, adds);
+            return;
+        }
         if (imageOperationRabbitEnabled) {
             postImageOperationPipelineService.scheduleCreate(postId, adds);
             return;
@@ -53,7 +59,16 @@ public class ImageServiceImpl implements ImageService {
     public void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove) {
         List<String> adds = copyNullableList(toAdd);
         List<String> removes = copyNullableList(toRemove);
+        if (usesFinalPostKeys(adds)) {
+            imagePersistenceTransactionService.updateFinalPostImages(postId, adds, removes);
+            return;
+        }
         runAfterCommit(() -> postImageService.updatePostImages(postId, adds, removes));
+    }
+
+    @Override
+    public void deletePostImages(Long postId) {
+        imagePersistenceTransactionService.deletePostImages(postId);
     }
 
     @Override
@@ -127,7 +142,13 @@ public class ImageServiceImpl implements ImageService {
     }
 
     private List<String> copyNullableList(List<String> values) {
-        return values == null ? null : List.copyOf(values);
+        return values == null ? List.of() : List.copyOf(values);
+    }
+
+    private boolean usesFinalPostKeys(List<String> values) {
+        return values.stream().allMatch(value ->
+                value != null && (value.startsWith("posts/objects/") || value.contains("/posts/objects/"))
+        );
     }
 
     private void runAfterCommit(Runnable action) {

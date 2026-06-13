@@ -83,6 +83,8 @@ class PostImageServiceDbBenchmarkTest {
     private ImageStorageClient storageClient;
     @MockitoBean
     private ImageOperationConsumedMessageRepository consumedMessageRepository;
+    @MockitoBean
+    private core.global.entity.image.service.ImageUploadSessionService imageUploadSessionService;
 
     private Statistics statistics;
     private PostImageServiceImpl postImageService;
@@ -112,6 +114,7 @@ class PostImageServiceDbBenchmarkTest {
                 storageClient,
                 batchService,
                 persistenceTransactionService,
+                org.mockito.Mockito.mock(core.global.entity.image.service.ImageUploadSessionService.class),
                 org.mockito.Mockito.mock(S3Presigner.class),
                 org.mockito.Mockito.mock(S3Props.class),
                 org.mockito.Mockito.mock(ApplicationEventPublisher.class)

@@ -579,3 +579,63 @@ NCP Copy는 외부 I/O이므로 실행시간 동안 DB connection을 점유할 �
 
 - 동시성을 무제한으로 설정한다는 의미는 아니다.
 - 실제 Consumer 동시성 값은 운영 환경 측정으로 결정하되, 현재 worker 10개를 아키텍처의 고정 한도로 가정하지 않는다.
+
+## 24. Post 이미지는 UUID final key로 직접 업로드한다
+
+### 결정
+
+- `ImageType.POST` Presigned URL은 `temp/` 대신 `posts/objects/{uuid}.{ext}` final key를 발급한다.
+- Post 생성·수정 transaction에서 Post와 Image DB를 함께 반영한다.
+- Post 수정 성공 후 제거된 기존 object 삭제만 `DELETE_OBJECT + Outbox + RabbitMQ`로 처리한다.
+- 기존 `temp/` key 요청은 전환 기간 동안 기존 Copy 파이프라인 fallback을 유지한다.
+- Post에 등록되지 않은 UUID object는 별도 정리 배치의 대상으로 둔다.
+
+### 이유
+
+Post ID 기반 final key를 만들기 위해 staging object를 Copy하면서 Copy retry, DB 등록 retry, staging 삭제, 보상 삭제, timeout 복구가 필요해졌다. UUID final key는 Post 생성 전에도 발급할 수 있으므로 Copy 자체를 제거할 수 있다.
+
+Post와 Image DB를 같은 transaction에서 반영하면 사용자에게 필요한 정합성은 DB transaction으로 보장하고, RabbitMQ는 기존 object 삭제처럼 실패해도 사용자 데이터가 깨지지 않는 후처리에 집중할 수 있다.
+
+### 채택하지 않은 대안
+
+- Post ID 기반 object key를 유지하기 위한 전체 Copy 재시도 파이프라인
+- Image DB 등록과 Post 수정을 RabbitMQ Consumer에서 수행
+- Post transaction 안에서 NCP Copy 실행
+
+### 변경 시 주의
+
+- `ImageType.POST`는 Poll에서도 공유하므로 새 Presigned key 규칙은 Poll 업로드에도 적용된다.
+- Post transaction 실패 시 업로드된 final object가 남을 수 있으므로 미등록 object 정리 배치가 필요하다.
+- UUID key 구조에서는 Post folder 전체 삭제보다 DB에 등록된 object 단위 삭제가 안전하다.
+- 기존 앱의 `temp/` key 지원을 제거하기 전 사용 비율과 migration 완료 여부를 확인해야 한다.
+
+## 25. 미등록 Post UUID object는 `image_upload_session`으로 추적한다
+
+### 결정
+
+- Post용 Presigned URL 발급 시 `image_upload_session`을 `ISSUED`로 저장한다.
+- Post/Image 저장 transaction에서 session row를 잠그고 요청 사용자 소유권을 검증한 뒤 `REGISTERED`로 전환한다.
+- 만료 배치는 `(status, expires_at)` index로 만료된 `ISSUED` session만 조회한다.
+- 이미 `Image.url`에서 사용 중인 session은 `REGISTERED`, 미사용 session은 `DELETE_PENDING`으로 전환한다.
+- Poll 저장 transaction도 존재하는 session을 잠그고 `REGISTERED`로 전환한다. session이 없는 기존 staging Copy 결과는 호환을 위해 허용한다.
+- `DELETE_PENDING + CLEANUP_ONLY + DELETE_OBJECT + Outbox`는 같은 transaction에서 저장한다.
+- Consumer 삭제 성공 시 `DELETED`, retry 한도 초과 시 `DELETE_FAILED`로 전환한다.
+
+### 이유
+
+UUID final key 직접 업로드에서는 Post 등록 이전에 object가 생성되므로 미완료 업로드를 별도로 추적해야 한다. session row lock을 사용하면 Post 등록과 만료 정리가 동시에 같은 key의 상태를 확정하지 못하며, Object Storage 전체 순회도 제거할 수 있다.
+
+### 채택하지 않은 대안
+
+- Object Storage 전체 prefix pagination
+- 배치에서 NCP object를 즉시 삭제
+- `Image.url` 존재 여부만으로 정리 대상 판단
+- Post folder 단위 삭제
+
+### 변경 시 주의
+
+- 현재 서버는 실제 PUT 완료 callback을 받지 않으므로 `UPLOADED` 상태를 정확하게 구분하지 않고 `ISSUED`로 유지한다.
+- `retention`은 실제 클라이언트가 업로드 후 Post를 제출할 수 있는 최대 허용 시간보다 길게 설정해야 한다.
+- `ImageType.POST`는 Poll도 공유하므로 만료 처리 시 `Image.url` 사용 여부를 함께 확인해야 한다.
+- 향후 다중 서버에서 만료 배치를 병렬 실행하면 `FOR UPDATE SKIP LOCKED` 적용을 검토해야 한다.
+- terminal session 상태의 보관 기간과 이력 정리 배치는 별도로 결정해야 한다.

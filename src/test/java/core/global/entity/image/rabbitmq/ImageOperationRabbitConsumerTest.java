@@ -6,6 +6,7 @@ import core.global.entity.image.service.ImageOperationPipelineExecutor;
 import core.global.entity.image.service.ImageOperationRecoveryService;
 import core.global.entity.image.service.FailedImageCleanupService;
 import core.global.entity.image.service.PostImageOperationPipelineService;
+import core.global.entity.image.service.ImageUploadSessionService;
 import core.global.enums.common.ImageCleanupOperationType;
 import core.global.enums.common.ImageOperationStepType;
 import org.junit.jupiter.api.Test;
@@ -33,6 +34,8 @@ class ImageOperationRabbitConsumerTest {
     private ImageOperationPipelineExecutor pipelineExecutor;
     @Mock
     private PostImageOperationPipelineService postPipelineService;
+    @Mock
+    private ImageUploadSessionService uploadSessionService;
 
     @InjectMocks
     private ImageOperationRabbitConsumer consumer;
@@ -57,6 +60,7 @@ class ImageOperationRabbitConsumerTest {
         consumer.consume(message);
 
         verify(objectDeleteExecutor).deleteObject(message.targetKey());
+        verify(uploadSessionService).completeDelete(message.targetKey());
         verify(recoveryService).markCompleted(any());
     }
 

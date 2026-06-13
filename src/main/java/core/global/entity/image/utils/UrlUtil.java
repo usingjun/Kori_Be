@@ -5,6 +5,7 @@ import core.global.enums.common.ImageType;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 
 public final class UrlUtil {
 
@@ -60,6 +61,16 @@ public final class UrlUtil {
         String clean = trimSlashes(filename);
         String cat = imageType.name().toLowerCase();
         return "temp/" + cat + "/" + ownerKey + "/" + uploadSessionId + "/" + clean;
+    }
+
+    public static String buildPostFinalKey(String filename) {
+        String clean = trimSlashes(filename);
+        int extensionIndex = clean.lastIndexOf('.');
+        String extension = extensionIndex >= 0 ? clean.substring(extensionIndex).toLowerCase() : "";
+        if (!extension.matches("\\.[a-z0-9]{1,10}")) {
+            extension = "";
+        }
+        return "posts/objects/" + UUID.randomUUID() + extension;
     }
 
 

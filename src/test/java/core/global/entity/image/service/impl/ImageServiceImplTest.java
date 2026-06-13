@@ -1,6 +1,7 @@
 package core.global.entity.image.service.impl;
 
 import core.global.entity.image.service.ImageStorageClient;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
 import core.global.entity.image.service.PostImageOperationPipelineService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.service.ProfileImageService;
@@ -34,6 +35,8 @@ class ImageServiceImplTest {
     private MainContentImageService mainContentImageService;
     @Mock
     private PostImageOperationPipelineService postImageOperationPipelineService;
+    @Mock
+    private ImagePersistenceTransactionService imagePersistenceTransactionService;
 
     @InjectMocks
     private ImageServiceImpl imageService;
@@ -77,6 +80,22 @@ class ImageServiceImplTest {
     }
 
     @Test
+    void updatePostImagesRegistersFinalKeyInsideCurrentTransaction() {
+        imageService.updatePostImages(
+                10L,
+                List.of("posts/objects/new.jpg"),
+                List.of("posts/10/old.jpg")
+        );
+
+        verify(imagePersistenceTransactionService).updateFinalPostImages(
+                10L, List.of("posts/objects/new.jpg"), List.of("posts/10/old.jpg")
+        );
+        verify(postImageService, never()).updatePostImages(
+                10L, List.of("posts/objects/new.jpg"), List.of("posts/10/old.jpg")
+        );
+    }
+
+    @Test
     void savePostImagesDoesNotRunAfterRollback() {
         TransactionSynchronizationManager.initSynchronization();
 
@@ -94,6 +113,26 @@ class ImageServiceImplTest {
 
         verify(postImageOperationPipelineService).scheduleCreate(10L, List.of("temp/a.jpg"));
         verify(postImageService, never()).savePostImages(10L, List.of("temp/a.jpg"));
+    }
+
+    @Test
+    void savePostImagesRegistersFinalKeysInsideCurrentTransaction() {
+        imageService.savePostImages(10L, List.of("posts/objects/new.jpg"));
+
+        verify(imagePersistenceTransactionService).saveFinalPostImages(
+                10L, List.of("posts/objects/new.jpg")
+        );
+        verify(postImageOperationPipelineService, never()).scheduleCreate(
+                10L, List.of("posts/objects/new.jpg")
+        );
+    }
+
+    @Test
+    void deletePostImagesDelegatesToTransactionalPersistenceService() {
+        imageService.deletePostImages(10L);
+
+        verify(imagePersistenceTransactionService).deletePostImages(10L);
+        verify(imageStorageClient, never()).deleteFolder("posts/10");
     }
 
     @Test

@@ -20,6 +20,8 @@ public interface ImageService {
 
     void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove);
 
+    void deletePostImages(Long postId);
+
     void upsertPollImages(Long id, List<String> addImageUrls, List<String> removeImageUrls, PollType type);
 
     @Transactional

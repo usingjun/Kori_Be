@@ -188,9 +188,29 @@ FailedImageCleanup 저장
 - Post가 삭제된 뒤 늦게 도착한 DB 등록 요청은 실패 처리한다.
 - Consumer 실행 중 서버 종료로 Copy 또는 DB 등록 step이 오래 `PROCESSING`에 남으면 timeout scheduler가 retry queue로 복구한다.
 - RabbitMQ 비활성화 시에는 기존 `afterCommit + postImageExecutor` 경로를 유지한다.
-- 현재 전체 재시도 적용 범위는 Post 생성이며, Post 수정과 Poll은 아직 기존 직접 비동기 경로다.
+- 기존 `temp/` Post 생성 요청만 전체 재시도 Copy 파이프라인을 사용한다. 신규 UUID final key 요청은 Post transaction에서 Image DB를 직접 반영한다.
 - 이미지 전체 회귀 테스트는 통과했다.
-- 최신 `./scripts/agent-check.sh`는 205개 중 18개가 실패했고 4개는 skip됐다. 실패 원인은 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"`다.
+- 최신 `./scripts/agent-check.sh`는 223개 중 18개가 실패했고 4개는 skip됐다. 실패 원인은 기존 환경 제한인 `ERROR: permission denied to create extension "pgroonga"`다.
+
+### 17. Post UUID final key 직접 업로드
+
+- `ImageType.POST` Presigned URL은 `posts/objects/{uuid}.{ext}` key를 발급한다.
+- 새 final key를 사용하는 Post 생성은 Post transaction 안에서 Image DB를 함께 저장한다.
+- 새 final key를 사용하는 Post 수정은 같은 transaction에서 새 Image 등록, 제거 Image 삭제, 순서 변경을 적용한다.
+- 제거된 기존 object는 기존 `DELETE_OBJECT + Outbox + RabbitMQ retry/DLQ`로 삭제한다.
+- 신규 Post 흐름에서는 `COPY_STAGING_TO_FINAL`, `REGISTER_IMAGE_DB`, `DELETE_STAGING`, Copy 보상 삭제가 필요하지 않다.
+- 전환 기간 동안 기존 `temp/` key는 기존 Copy 재시도 파이프라인으로 처리한다.
+
+### 18. `image_upload_session` 기반 미등록 UUID object 정리
+
+- Post용 Presigned URL 발급 시 `image_upload_session`을 `ISSUED` 상태로 저장한다.
+- Post/Image 저장 transaction에서 session row를 잠그고 소유권을 검증한 뒤 `REGISTERED`로 함께 commit한다.
+- 만료 배치는 Object Storage 전체를 조회하지 않고 `(status, expires_at)` index로 만료된 `ISSUED` session 최대 200건만 조회한다.
+- Poll 등 다른 흐름에서 이미 `Image.url`로 사용 중인 key는 `REGISTERED`로 정리한다.
+- Poll 이미지 저장 transaction도 존재하는 session row를 잠그고 `REGISTERED`로 전환하며, session이 없는 기존 staging Copy 결과는 허용한다.
+- 미사용 session은 `DELETE_PENDING + CLEANUP_ONLY + DELETE_OBJECT + Outbox`를 같은 transaction에서 저장한다.
+- Consumer 삭제 성공 시 `DELETED`, retry 한도 초과 시 `DELETE_FAILED`로 갱신한다.
+- 실제 삭제 직전 `Image.url` 재확인도 유지한다.
 
 ## 현재 진행 중인 작업
 
@@ -232,7 +252,7 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 
 - 실제 RabbitMQ 환경에서 Post 생성 `Copy → REGISTER_IMAGE_DB → DELETE_STAGING` 흐름 검증
 - Copy, DB 등록, staging 삭제 각각의 retry/DLQ 및 서버 재시작 복구 검증
-- Post 수정과 Poll에 전체 재시도 파이프라인 확장
+- Poll에 전체 재시도 파이프라인 확장
 - 최종 구조의 실제 NCP Copy benchmark 재측정
 - 현재 polling 기반 Outbox 처리 지연 측정
 - 측정 결과에 따른 Outbox 발행 지연 개선 여부 결정
@@ -256,9 +276,9 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 
 ## 다음 우선순위 작업
 
-1. 실제 RabbitMQ/NCP 환경에서 Post 생성 전체 재시도 흐름을 검증한다.
-2. 검증 결과를 바탕으로 Post 수정 전체 재시도 payload와 최신 요청 보호 규칙을 설계한다.
-3. Post 수정 적용 후 Poll에 같은 구조를 확장한다.
+1. UUID final key 직접 업로드와 Post/Image 동일 transaction을 실제 환경에서 검증한다.
+2. 미등록 UUID object 정리 배치를 실제 NCP 환경에서 검증한다.
+3. Poll이 공유하는 `ImageType.POST` final key 흐름을 검증한다.
 4. 최종 구조의 실제 NCP Copy benchmark와 Outbox 발행 지연을 측정한다.
 5. 결과에 따라 Outbox 즉시 발행 신호 적용 여부를 결정한다.
 
@@ -282,9 +302,10 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 | 기존 Copy `PROCESSING` 방치 복구 | 미완료 | 기존 315개에 대한 timeout 복구 필요 |
 | Copy 제한 병렬 처리 | 검토 대기 | NCP `CopyAll` 미제공, 필요 시 동시성 5~10 검토 |
 | 전체 비동기 작업 요청 durable Outbox | 검토 대기 | 현재 `afterCommit` callback 유실 가능성 존재 |
-| Post 생성 전체 재시도 Outbox | 완료 | `COPY_STAGING_TO_FINAL → REGISTER_IMAGE_DB → DELETE_STAGING` |
+| 기존 temp Post 생성 fallback | 완료 | `COPY_STAGING_TO_FINAL → REGISTER_IMAGE_DB → DELETE_STAGING` |
 | Copy/Register timeout 복구 | 완료 | 오래된 `PROCESSING`을 retry/DLQ로 전환 |
-| Post 수정/Poll 전체 재시도 Outbox | 미완료 | 최신 요청 보호와 제거/순서 변경 payload 설계 필요 |
+| Post UUID final key 직접 업로드 | 완료 | Copy 제거, Post/Image 동일 transaction, 기존 object cleanup Outbox |
+| 미등록 UUID object 정리 배치 | 완료 | `image_upload_session` 만료 조회, Outbox 예약, 삭제 결과 추적 |
 
 ## 구조 개선 커밋 기준
 
