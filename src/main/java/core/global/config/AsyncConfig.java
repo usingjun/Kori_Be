@@ -68,6 +68,21 @@ public class AsyncConfig implements AsyncConfigurer {
 
         return executor;
     }
+
+    @Bean(name = "postImageExecutor")
+    public Executor postImageExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("Async-Post-Image-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+
+        return executor;
+    }
+
     @Bean(name = "chatAsyncExecutor")
     public Executor chatAsyncExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();

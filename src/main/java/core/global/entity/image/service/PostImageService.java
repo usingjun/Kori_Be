@@ -13,10 +13,8 @@ public interface PostImageService {
 
     List<PresignedUrlResponse> generatePresignedUrls(PresignedUrlRequest request);
 
-    @Transactional
     void savePostImages(Long postId, List<String> toAdd);
 
-    @Transactional
     void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove);
 
     @Transactional

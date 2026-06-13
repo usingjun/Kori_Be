@@ -565,15 +565,7 @@ public class PostServiceImpl implements PostService {
             throw new BusinessException(CommunityErrorCode.POST_DELETE_FORBIDDEN);
         }
 
-        String folderPrefix = "posts/" + postId;
-        try {
-            imageService.deleteFolder(folderPrefix);
-        } catch (BusinessException ex) {
-            log.warn("S3 폴더 삭제 실패(prefix={}): {}", folderPrefix, ex.getMessage());
-        }
-
-        imageRepository.deleteByImageTypeAndRelatedId(ImageType.POST, postId);
-
+        imageService.deletePostImages(postId);
         postRepository.delete(post);
     }
 

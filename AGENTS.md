@@ -19,6 +19,29 @@ Existing backend project. Read existing code before editing.
 - High-risk areas include security/JWT/OAuth, WebSocket/chat, payment/IAP, image storage, search/PGroonga, Flyway migrations, external API integrations, and admin side-effect endpoints.
 - Never revert or overwrite existing user changes in the working tree.
 
+## Documentation
+
+Before starting work, review the following documents if they exist:
+
+* docs/agent/progress.md
+* docs/agent/decision-log.md
+* docs/agent/handoff.md
+
+If the current task affects project status, architectural decisions, or future handoff, update the relevant documents before considering the task complete.
+
+Documentation updates are part of the Definition of Done.
+
+## Context Management
+
+When context usage becomes high or a task is expected to continue in another session:
+
+* Update docs/agent/progress.md with the latest task status.
+* Update docs/agent/decision-log.md with important design decisions and trade-offs.
+* Update docs/agent/handoff.md so another session can continue the work without relying on previous conversation history.
+
+Prioritize recording why decisions were made, not only what was implemented.
+
+
 ## Validation
 Run:
 

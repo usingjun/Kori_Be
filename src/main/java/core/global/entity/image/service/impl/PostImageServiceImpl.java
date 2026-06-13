@@ -8,38 +8,37 @@ import core.global.entity.image.dto.PresignedUrlResponse;
 import core.global.entity.image.entity.Image;
 import core.global.entity.image.repository.ImageRepository;
 import core.global.entity.image.service.ImageStorageClient;
+import core.global.entity.image.service.ImageOperationBatchService;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
+import core.global.entity.image.service.ImageUploadSessionService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.utils.UrlUtil;
+import core.global.config.CustomUserDetails;
 import core.global.enums.ImageModerationStatus;
+import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageOperationType;
 import core.global.enums.common.ImageType;
 import core.global.enums.errorcode.ImageErrorCode;
 import core.global.exception.BusinessException;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
-import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.MetadataDirective;
 import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
-import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
 
 import java.io.IOException;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executor;
 
 @Slf4j
 @Service
@@ -49,11 +48,13 @@ public class PostImageServiceImpl implements PostImageService {
     private final S3Client s3Client;
     private final ImageRepository imageRepository;
     private final ImageStorageClient storageClient;
+    private final ImageOperationBatchService imageOperationBatchService;
+    private final ImagePersistenceTransactionService persistenceTransactionService;
+    private final ImageUploadSessionService uploadSessionService;
     private final S3Presigner s3Presigner;
     private final S3Props s3Props;
     private final ApplicationEventPublisher eventPublisher;
-    @Qualifier("imageExecutor") // AsyncConfig에서 정의한 빈 주입
-    private final Executor imageExecutor;
+
     @Value("${ncp.s3.bucket}")
     private String bucket;
     @Value("${ncp.s3.endpoint}")
@@ -65,8 +66,10 @@ public class PostImageServiceImpl implements PostImageService {
      * ✅ Presigned URL 생성 (일괄)
      */
     @Override
+    @org.springframework.transaction.annotation.Transactional
     public List<PresignedUrlResponse> generatePresignedUrls(PresignedUrlRequest request) {
         String email = SecurityContextHolder.getContext().getAuthentication().getName();
+        Long ownerId = currentUserId();
 
         if (request.files() == null || request.files().isEmpty()) {
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
@@ -78,12 +81,13 @@ public class PostImageServiceImpl implements PostImageService {
 
         List<PresignedUrlResponse> out = new ArrayList<>(request.files().size());
         for (PresignedUrlRequest.FileSpec f : request.files()) {
-            out.add(generateOne(email, request.imageType(), request.uploadSessionId(), f));
+            out.add(generateOne(ownerId, email, request.imageType(), request.uploadSessionId(), f));
         }
         return out;
     }
 
     private PresignedUrlResponse generateOne(
+            Long ownerId,
             String email,
             ImageType imageType,
             String uploadSessionId,
@@ -94,7 +98,9 @@ public class PostImageServiceImpl implements PostImageService {
                 ? "image/jpeg"
                 : fileSpec.contentType();
 
-        String key = UrlUtil.buildRawKey(email, imageType, uploadSessionId, filename);
+        String key = imageType == ImageType.POST
+                ? UrlUtil.buildPostFinalKey(filename)
+                : UrlUtil.buildRawKey(email, imageType, uploadSessionId, filename);
 
         // 서명에 포함할 메타데이터
         Map<String, String> meta = Map.of(
@@ -125,6 +131,9 @@ public class PostImageServiceImpl implements PostImageService {
         clientHeaders.put("x-amz-meta-image-type", imageType.name().toLowerCase());
 
         String publicUrl = UrlUtil.buildPublicUrlFromKey(endPoint, bucket, key);
+        if (imageType == ImageType.POST) {
+            uploadSessionService.issue(key, ownerId, imageType);
+        }
 
         return new PresignedUrlResponse(
                 key,
@@ -134,83 +143,91 @@ public class PostImageServiceImpl implements PostImageService {
         );
     }
 
-    @Async("imageExecutor")
+    private Long currentUserId() {
+        Object principal = SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        if (principal instanceof CustomUserDetails userDetails) {
+            return userDetails.getUserId();
+        }
+        throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
+    }
+
+    @Async("postImageExecutor")
     @Override
-    @Transactional
     public void savePostImages(Long postId, List<String> toAdd) throws BusinessException {
         final List<String> adds = normalizeList(toAdd);
         if (adds.isEmpty()) return;
 
         // 1) 이미지가 존재하면 예외
-        if (imageRepository.existsByImageTypeAndRelatedId(ImageType.POST, postId)) {
+        if (persistenceTransactionService.postImagesExist(postId)) {
             throw new BusinessException(ImageErrorCode.POST_IMAGES_ALREADY_EXIST);
         }
 
         final String basePrefix = "posts/" + postId;
 
-        // 3) 병렬 COPY (스테이징 원본은 목록에 모아 한 번에 삭제)
-        CopyResult copyResult = copyNewImagesInParallel(
+        // imageExecutor 안에서 다시 작업을 제출하지 않고 현재 비동기 작업에서 순차 Copy한다.
+        CopyResult copyResult = copyNewImagesSequentially(
                 postId,
                 adds,
                 basePrefix,
                 Collections.emptySet(),
-                0
+                0,
+                ImageOperationType.CREATE_POST_IMAGES
         );
-
-        // 4) DB 저장
-        if (!copyResult.toSave().isEmpty()) {
-            List<Image> savedImages = imageRepository.saveAll(copyResult.toSave());
-
-            publishModerationEvents(savedImages);
-        }
-
-        // 스테이징 원본 삭제
-        if (!copyResult.stagingToDelete().isEmpty()) {
-            storageClient.deleteObjectsBulk(copyResult.stagingToDelete());
+        try {
+            persistenceTransactionService.persist(
+                    ImageOperationOwnerType.POST,
+                    postId,
+                    ImagePersistenceTransactionService.PersistenceSnapshot.empty(),
+                    copyResult.toSave(),
+                    copyResult.trackedCopies()
+            );
+        } catch (RuntimeException e) {
+            imageOperationBatchService.compensate(copyResult.trackedCopies());
+            throw e;
         }
     }
 
-    @Async("imageExecutor")
+    @Async("postImageExecutor")
     @Override
-    @Transactional
     public void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove) {
         final List<String> adds = normalizeList(toAdd);
         final List<String> removes = normalizeList(toRemove);
         if (adds.isEmpty() && removes.isEmpty()) return;
 
-        // 1) DB 삭제 + 삭제 대상 키 수집(사용자 제거)
-        List<String> bulkDeleteKeys = deleteRemovedImagesAndCollectKeys(postId, removes);
-
-        // 2) 생존 이미지 조회 + position 재정렬 + 생존 URL 집합 생성
-        SurvivorContext survivorContext = loadAndReorderSurvivors(postId);
+        ImagePersistenceTransactionService.PersistenceSnapshot snapshot =
+                persistenceTransactionService.loadSnapshot(postId, removes);
 
         if (adds.isEmpty()) {
-            // 추가할 게 없으면 여기서 삭제 끝내고 종료
-            storageClient.deleteObjectsBulk(bulkDeleteKeys);
+            persistenceTransactionService.persist(
+                    ImageOperationOwnerType.POST, postId, snapshot, List.of(), List.of()
+            );
             return;
         }
 
         final String basePrefix = "posts/" + postId;
 
-        // 3) 병렬 COPY (스테이징 원본은 목록에 모아 한 번에 삭제)
-        CopyResult copyResult = copyNewImagesInParallel(
+        // imageExecutor 안에서 다시 작업을 제출하지 않고 현재 비동기 작업에서 순차 Copy한다.
+        CopyResult copyResult = copyNewImagesSequentially(
                 postId,
                 adds,
                 basePrefix,
-                survivorContext.survivorUrls(),
-                survivorContext.nextPosition()
+                snapshot.survivorUrls(),
+                snapshot.nextPosition(),
+                ImageOperationType.UPDATE_POST_IMAGES
         );
 
-        // 4) DB 저장
-        if (!copyResult.toSave().isEmpty()) {
-            List<Image> savedImages = imageRepository.saveAll(copyResult.toSave());
-
-            publishModerationEvents(savedImages);
+        try {
+            persistenceTransactionService.persist(
+                    ImageOperationOwnerType.POST,
+                    postId,
+                    snapshot,
+                    copyResult.toSave(),
+                    copyResult.trackedCopies()
+            );
+        } catch (RuntimeException e) {
+            imageOperationBatchService.compensate(copyResult.trackedCopies());
+            throw e;
         }
-
-        // 5) S3 삭제(사용자 제거 + 스테이징 원본)
-        bulkDeleteKeys.addAll(copyResult.stagingToDelete());
-        storageClient.deleteObjectsBulk(bulkDeleteKeys);
     }
 
     @Async("imageExecutor")
@@ -347,94 +364,66 @@ public class PostImageServiceImpl implements PostImageService {
         return (list == null) ? List.of() : list;
     }
 
-    private CopyResult copyNewImagesInParallel(
+    private CopyResult copyNewImagesSequentially(
             Long postId,
             List<String> adds,
             String basePrefix,
             Set<String> survivorUrls,
-            int startOrder
+            int startOrder,
+            ImageOperationType operationType
     ) {
-        var stagingToDelete = new ConcurrentLinkedQueue<String>();
+        List<ImageOperationBatchService.TrackedCopy> trackedCopies = new ArrayList<>();
+        List<Image> toSave = new ArrayList<>(adds.size());
+        List<PendingCopy> pendingCopies = new ArrayList<>();
 
-        // 1. CompletableFuture를 사용하여 imageExecutor에서 비동기 작업 스트림 생성
-        List<CompletableFuture<Image>> futures = new ArrayList<>();
-
-        for (int i = 0; i < adds.size(); i++) {
-            final int myOrder = startOrder + i;
-            final String raw = adds.get(i);
-
-            var future = CompletableFuture.supplyAsync(() -> {
+        try {
+            for (int i = 0; i < adds.size(); i++) {
+                int myOrder = startOrder + i;
+                String raw = adds.get(i);
                 String srcKey = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, raw);
 
-                // 1) 기본 이미지인 경우
                 if (isDefaultUrlOrKey(srcKey)) {
                     String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, srcKey);
-                    if (survivorUrls.contains(finalUrl)) return null;
-                    return Image.of(ImageType.POST, postId, finalUrl, myOrder);
+                    if (!survivorUrls.contains(finalUrl)) {
+                        toSave.add(Image.of(ImageType.POST, postId, finalUrl, myOrder));
+                    }
+                    continue;
                 }
 
-                // 2) 일반/스테이징 이미지인 경우
-                String finalKey = ensureFinalKey(basePrefix, myOrder, srcKey);
+                String finalKey = finalKey(basePrefix, myOrder, srcKey);
                 String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, finalKey);
-                if (survivorUrls.contains(finalUrl)) return null;
-
-                if (storageClient.isStagingKey(srcKey) && !srcKey.equals(finalKey) && !isDefaultUrlOrKey(srcKey)) {
-                    stagingToDelete.add(srcKey);
+                if (storageClient.isStagingKey(srcKey) && !srcKey.equals(finalKey)) {
+                    pendingCopies.add(new PendingCopy(srcKey, finalKey, finalUrl, myOrder));
+                } else if (!survivorUrls.contains(finalUrl)) {
+                    toSave.add(Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null));
                 }
+            }
 
-                return Image.of(ImageType.POST, postId, finalUrl, myOrder, ImageModerationStatus.CLEAN, null);
-            }, imageExecutor); // 🚀 Spring이 관리하는 스레드 풀 사용
-
-            futures.add(future);
-        }
-
-        // 2. 모든 작업이 완료될 때까지 대기 및 결과 수집
-        try {
-            List<Image> toSave = futures.stream()
-                    .map(CompletableFuture::join) // 결과가 나올 때까지 대기
-                    .filter(Objects::nonNull)
-                    .toList();
-
-            return new CopyResult(toSave, new ArrayList<>(stagingToDelete));
+            trackedCopies.addAll(imageOperationBatchService.copyAll(
+                    operationType,
+                    ImageOperationOwnerType.POST,
+                    postId,
+                    pendingCopies.stream()
+                            .map(copy -> new ImageOperationBatchService.CopyRequest(copy.sourceKey(), copy.targetKey()))
+                            .toList()
+            ));
+            for (PendingCopy pendingCopy : pendingCopies) {
+                if (!survivorUrls.contains(pendingCopy.finalUrl())) {
+                    toSave.add(Image.of(
+                            ImageType.POST,
+                            postId,
+                            pendingCopy.finalUrl(),
+                            pendingCopy.order(),
+                            ImageModerationStatus.CLEAN,
+                            null
+                    ));
+                }
+            }
+            return new CopyResult(toSave, trackedCopies);
         } catch (Exception e) {
-            log.error("[POST IMG] Parallel copy failed", e);
+            log.error("[POST IMG] Sequential copy failed", e);
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
-    }
-
-    private List<String> deleteRemovedImagesAndCollectKeys(Long postId, List<String> removes) {
-        List<String> bulkDeleteKeys = new ArrayList<>();
-        if (!removes.isEmpty()) {
-            List<String> removeKeys = removes.stream()
-                    .map(raw -> UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, raw))
-                    .toList();
-            List<String> removeUrls = removeKeys.stream()
-                    .map(k -> UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, k))
-                    .toList();
-            imageRepository.deleteByImageTypeAndRelatedIdAndUrlIn(ImageType.POST, postId, removeUrls);
-
-            bulkDeleteKeys.addAll(
-                    removeKeys.stream().filter(k -> !isDefaultUrlOrKey(k)).toList()
-            );
-        }
-        return bulkDeleteKeys;
-    }
-
-    private SurvivorContext loadAndReorderSurvivors(Long postId) {
-        List<Image> survivors = imageRepository
-                .findByImageTypeAndRelatedIdOrderByPositionAsc(ImageType.POST, postId);
-
-        int pos = 0;
-        Set<String> survivorUrls = new HashSet<>();
-        for (Image img : survivors) {
-            img.changePosition(pos++);
-
-            String storedKey = UrlUtil.toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, img.getUrl());
-            String finalUrl = UrlUtil.buildCdnUrlFromKey(cdnBaseUrl, storedKey);
-            survivorUrls.add(finalUrl);
-        }
-
-        return new SurvivorContext(survivors, survivorUrls, pos);
     }
 
     private boolean isDefaultUrlOrKey(String keyOrUrl) {
@@ -444,43 +433,20 @@ public class PostImageServiceImpl implements PostImageService {
         return k.startsWith("default/"); // 예: default/character_03.png
     }
 
-    private String ensureFinalKey(String basePrefix, int order, String srcKey) {
+    private String finalKey(String basePrefix, int order, String srcKey) {
         String base = basePrefix.endsWith("/") ? basePrefix.substring(0, basePrefix.length() - 1) : basePrefix;
         if (!storageClient.isStagingKey(srcKey)) return srcKey;
 
         String basename = srcKey.substring(srcKey.lastIndexOf('/') + 1);
-        String dstKey = "%s/%03d_%s".formatted(base, order, basename);
-        if (srcKey.equals(dstKey)) return srcKey;
-
-        try {
-            s3Client.copyObject(b -> b
-                    .sourceBucket(bucket).sourceKey(srcKey)
-                    .destinationBucket(bucket).destinationKey(dstKey)
-                    .acl(ObjectCannedACL.PUBLIC_READ)
-                    .metadataDirective(MetadataDirective.COPY)
-            );
-        } catch (S3Exception e) {
-            log.warn("[POST IMG] copy failed: src={}, dst={}, status={}, msg={}",
-                    srcKey, dstKey, e.statusCode(),
-                    e.awsErrorDetails() != null ? e.awsErrorDetails().errorMessage() : e.getMessage());
-            throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
-        } catch (SdkException e) {
-            log.warn("[POST IMG] copy failed: src={}, dst={}, err={}", srcKey, dstKey, e.getMessage());
-            throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
-        }
-        return dstKey; // ← 여기서 삭제하지 않음
-    }
-
-    private record SurvivorContext(
-            List<Image> survivors,
-            Set<String> survivorUrls,
-            int nextPosition
-    ) {
+        return "%s/%03d_%s".formatted(base, order, basename);
     }
 
     private record CopyResult(
             List<Image> toSave,
-            List<String> stagingToDelete
+            List<ImageOperationBatchService.TrackedCopy> trackedCopies
     ) {
+    }
+
+    private record PendingCopy(String sourceKey, String targetKey, String finalUrl, int order) {
     }
 }

@@ -4,9 +4,15 @@ import core.global.entity.image.dto.ImageDto;
 import core.global.entity.image.dto.ImageModerationEvent;
 import core.global.entity.image.entity.Image;
 import core.global.entity.image.repository.ImageRepository;
+import core.global.entity.image.service.ImageCopyExecutor;
+import core.global.entity.image.service.ImageOperationService;
+import core.global.entity.image.service.ImageOperationRecoveryService;
+import core.global.entity.image.service.ImageOperationStepService;
 import core.global.entity.image.service.ImageStorageClient;
 import core.global.entity.image.service.ProfileImageService;
 import core.global.enums.ImageModerationStatus;
+import core.global.enums.common.ImageOperationOwnerType;
+import core.global.enums.common.ImageOperationType;
 import core.global.enums.common.ImageType;
 import core.global.enums.errorcode.ImageErrorCode;
 import core.global.exception.BusinessException;
@@ -16,6 +22,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 import software.amazon.awssdk.core.exception.SdkException;
@@ -25,6 +33,7 @@ import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.MetadataDirective;
 import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 
 import java.util.Collections;
 import java.util.List;
@@ -46,6 +55,10 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     private final ImageRepository imageRepository;
     private final ImageStorageClient storageClient;
     private final ApplicationEventPublisher eventPublisher;
+    private final ImageOperationService imageOperationService;
+    private final ImageOperationStepService imageOperationStepService;
+    private final ImageOperationRecoveryService imageOperationRecoveryService;
+    private final ImageCopyExecutor imageCopyExecutor;
 
     @Value("${ncp.s3.bucket}")
     private String bucket;
@@ -53,6 +66,8 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     private String endPoint;
     @Value("${cdn.base-url}")
     private String cdnBaseUrl;
+    @Value("${image.cleanup.rabbit.enabled:false}")
+    private boolean imageOperationRabbitEnabled;
 
     /**
      * 초기 셋업 시 유저 프로필 설정
@@ -70,30 +85,48 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         RequestInfo requestInfo = resolveRequestInfo(requestedKeyOrUrl);
 
         // 3) 기본이미지가 아니면 헤더 검사(용량 제한 포함)
-        validateImageHeadIfNecessary(requestInfo);
+        HeadObjectResponse sourceHead = validateImageHeadIfNecessary(requestInfo);
 
         // 5) 최종 후보 키/URL 계산 (버전드 키 전략)
         String candidateFinalKey = computeCandidateFinalKey(userId, requestInfo);
-        String finalKey = moveStagingProfileIfNecessary(userId, requestInfo, candidateFinalKey);
-        String finalUrl = buildCdnUrlFromKey(cdnBaseUrl, finalKey);
-
-        Image targetImage = imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId)
+        Optional<Image> existingOpt =
+                imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId);
+        String oldKey = existingOpt
+                .map(Image::getUrl)
+                .filter(url -> !storageClient.isDefaultUrlOrKey(url))
+                .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
                 .orElse(null);
-
-        if (targetImage != null) {
-            // A. 이미 존재하면 -> URL 업데이트
-            log.info("[Profile Setup] 기존 이미지 업데이트 - ID: {}, New URL: {}", targetImage.getId(), finalUrl);
-            targetImage.updateUrl(finalUrl);
-        } else {
-            // B. 없으면 -> 새로 생성 및 저장
-            log.info("[Profile Setup] 새 이미지 생성 및 저장 - userId: {}", userId);
-            // saveImageInDB가 저장된 엔티티를 반환하도록 수정해야 합니다.
-            saveImageInDB(userId, ImageType.USER, finalKey);
-
-            targetImage = imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId)
-                    .orElse(null);
+        ImageOperationService.CopyOperationPlan copyPlan = null;
+        String finalKey = candidateFinalKey;
+        if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
+            copyPlan = copyProfileImage(
+                    ImageOperationType.CREATE_USER_PROFILE_IMAGE,
+                    userId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
+            finalKey = copyPlan.targetKey();
         }
 
+        Image targetImage;
+        try {
+            targetImage = upsertProfileImageEntityAndFlush(userId, ImageType.USER, existingOpt, finalKey);
+        } catch (RuntimeException e) {
+            if (copyPlan != null) {
+                createCompensation(copyPlan, finalKey);
+            }
+            throw e;
+        }
+
+        scheduleCleanupAndRollbackCompensation(
+                ImageOperationOwnerType.USER,
+                userId,
+                oldKey,
+                requestInfo,
+                finalKey,
+                copyPlan
+        );
         publishImageModerationEvent(finalKey, targetImage);
         log.info("[Profile Setup] 유저 프로필 이미지 저장 성공 - userId: {}, finalKey: {}", userId, finalKey);
     }
@@ -119,7 +152,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
                 requestInfo.isDefaultIncoming(), requestInfo.isStaging(), requestInfo.getReqKey());
 
         // 3) 용량 및 헤더 검증
-        validateImageHeadIfNecessary(requestInfo);
+        HeadObjectResponse sourceHead = validateImageHeadIfNecessary(requestInfo);
 
         // 4) 기존 이미지 조회
         Optional<Image> existingOpt =
@@ -137,19 +170,42 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             return candidateFinalUrl;
         }
 
-        // 7) 기존 S3 삭제
-        deleteOldS3ImageIfNecessary(userId, existingOpt);
+        ImageOperationService.CopyOperationPlan copyPlan = null;
+        String finalKey = candidateFinalKey;
+        String oldKey = existingOpt
+                .map(Image::getUrl)
+                .filter(url -> !storageClient.isDefaultUrlOrKey(url))
+                .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
+                .orElse(null);
+        if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
+            copyPlan = copyProfileImage(
+                    ImageOperationType.UPDATE_USER_PROFILE_IMAGE,
+                    userId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
+            finalKey = copyPlan.targetKey();
+        }
 
-        // 8) 기존 DB 삭제 (Flush 포함)
-        imageRepository.deleteByImageTypeAndRelatedIdWithFlushing(ImageType.USER, userId);
-        log.info("[프로필 수정 - DB 초기화] 기존 이미지 레코드 삭제 완료 (Flush)");
+        String resultUrl;
+        try {
+            resultUrl = upsertProfileImageAndFlush(userId, ImageType.USER, existingOpt, finalKey);
+        } catch (RuntimeException e) {
+            if (copyPlan != null) {
+                createCompensation(copyPlan, finalKey);
+            }
+            throw e;
+        }
 
-        // 9) staging -> 영구 이동
-        String finalKey = moveStagingProfileIfNecessary(userId, requestInfo, candidateFinalKey);
-        log.info("[프로필 수정 - 이동 완료] 최종 확정된 Key: {}", finalKey);
-
-        // 10) 저장 및 결과 반환
-        String resultUrl = saveImageInDB(userId, ImageType.USER, finalKey);
+        scheduleCleanupAndRollbackCompensation(
+                ImageOperationOwnerType.USER,
+                userId,
+                oldKey,
+                requestInfo,
+                finalKey,
+                copyPlan
+        );
         log.info("[프로필 수정 종료] 성공적으로 변경되었습니다. finalUrl: {}", resultUrl);
 
         return resultUrl;
@@ -158,16 +214,8 @@ public class ProfileImageServiceImpl implements ProfileImageService {
     @Override
     @Transactional
     public void deleteUserProfileImage(Long userId) {
-
         imageRepository.deleteByImageTypeAndRelatedId(ImageType.USER, userId);
-        String folder = "users/%d/".formatted(userId);
-        try {
-            // 같은 클래스 내에 deleteFolder가 있다면 그대로 호출
-            storageClient.deleteFolder(folder);
-        } catch (BusinessException e) {
-            // 폴더 삭제 실패는 경고만 남기고, 아래 레거시 개별 삭제도 시도
-            log.warn("profile folder delete failed (ignored): {}", e.getMessage());
-        }
+        scheduleFolderCleanup(ImageOperationOwnerType.USER, userId, "users/%d/".formatted(userId));
     }
 
     @Override
@@ -198,16 +246,41 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         RequestInfo requestInfo = resolveRequestInfo(requestedKeyOrUrl);
 
         // 3) 기본이미지가 아니면 헤더 검사(용량 제한 포함)
-        validateImageHeadIfNecessary(requestInfo);
+        HeadObjectResponse sourceHead = validateImageHeadIfNecessary(requestInfo);
 
         // 5) 최종 후보 키/URL 계산
         String candidateFinalKey = computeChatRoomCandidateFinalKey(chatRoomId, requestInfo);
 
-        // 9) staging → 영구 이동 또는 as-is 사용
-        String finalKey = moveChatRoomStagingIfNecessary(chatRoomId, requestInfo, candidateFinalKey);
+        ImageOperationService.CopyOperationPlan copyPlan = null;
+        String finalKey = candidateFinalKey;
+        if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
+            copyPlan = copyChatRoomProfileImage(
+                    ImageOperationType.CREATE_CHAT_ROOM_PROFILE_IMAGE,
+                    chatRoomId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
+            finalKey = copyPlan.targetKey();
+        }
 
-        // 10) 저장 및 종료
-        saveImageInDB(chatRoomId, ImageType.CHAT_ROOM, finalKey);
+        try {
+            upsertProfileImageAndFlush(chatRoomId, ImageType.CHAT_ROOM, Optional.empty(), finalKey);
+        } catch (RuntimeException e) {
+            if (copyPlan != null) {
+                createCompensation(copyPlan, finalKey);
+            }
+            throw e;
+        }
+
+        scheduleCleanupAndRollbackCompensation(
+                ImageOperationOwnerType.CHAT_ROOM,
+                chatRoomId,
+                null,
+                requestInfo,
+                finalKey,
+                copyPlan
+        );
     }
 
     /**
@@ -227,7 +300,7 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         RequestInfo requestInfo = resolveRequestInfo(requestedKeyOrUrl);
 
         // 3) 기본이미지가 아니면 헤더 검사(용량 제한 포함)
-        validateImageHeadIfNecessary(requestInfo);
+        HeadObjectResponse sourceHead = validateImageHeadIfNecessary(requestInfo);
 
         // 4) 기존 이미지 조회
         Optional<Image> existingOpt =
@@ -242,33 +315,50 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             return candidateFinalUrl;
         }
 
-        // 7) 기존 S3 삭제 (있고, default가 아니면)
-        deleteOldS3ImageIfNecessaryForChatRoom(chatRoomId, existingOpt);
+        String oldKey = existingOpt
+                .map(Image::getUrl)
+                .filter(url -> !storageClient.isDefaultUrlOrKey(url))
+                .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
+                .orElse(null);
+        ImageOperationService.CopyOperationPlan copyPlan = null;
+        String finalKey = candidateFinalKey;
+        if (!requestInfo.isDefaultIncoming() && requestInfo.isStaging()) {
+            copyPlan = copyChatRoomProfileImage(
+                    ImageOperationType.UPDATE_CHAT_ROOM_PROFILE_IMAGE,
+                    chatRoomId,
+                    requestInfo,
+                    candidateFinalKey,
+                    sourceHead
+            );
+            finalKey = copyPlan.targetKey();
+        }
 
-        // 8) 기존 DB 삭제
-        imageRepository.deleteByImageTypeAndRelatedIdWithFlushing(ImageType.CHAT_ROOM, chatRoomId);
+        String resultUrl;
+        try {
+            resultUrl = upsertProfileImageAndFlush(chatRoomId, ImageType.CHAT_ROOM, existingOpt, finalKey);
+        } catch (RuntimeException e) {
+            if (copyPlan != null) {
+                createCompensation(copyPlan, finalKey);
+            }
+            throw e;
+        }
 
-        // 9) staging → 영구 이동 또는 as-is 사용
-        String finalKey = moveChatRoomStagingIfNecessary(chatRoomId, requestInfo, candidateFinalKey);
-
-        // 10) 저장 및 종료
-        return saveImageInDB(chatRoomId, ImageType.CHAT_ROOM, finalKey);
+        scheduleCleanupAndRollbackCompensation(
+                ImageOperationOwnerType.CHAT_ROOM,
+                chatRoomId,
+                oldKey,
+                requestInfo,
+                finalKey,
+                copyPlan
+        );
+        return resultUrl;
     }
 
     @Transactional
     @Override
     public void deleteChatRoomProfileImage(Long chatRoomId) {
-
-        String folder = "chatRoom/%d/".formatted(chatRoomId);
-        try {
-            // 같은 클래스 내에 deleteFolder가 있다면 그대로 호출
-            storageClient.deleteFolder(folder);
-        } catch (BusinessException e) {
-            // 폴더 삭제 실패는 경고만 남기고, 아래 레거시 개별 삭제도 시도
-            log.warn("profile folder delete failed (ignored): {}", e.getMessage());
-        }
-
         imageRepository.deleteByImageTypeAndRelatedId(ImageType.CHAT_ROOM, chatRoomId);
+        scheduleFolderCleanup(ImageOperationOwnerType.CHAT_ROOM, chatRoomId, "chatRoom/%d/".formatted(chatRoomId));
     }
 
     @Override
@@ -301,35 +391,55 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
 
-        if (imageRepository.existsByImageTypeAndRelatedId(ImageType.USER, userId)) {
-            throw new BusinessException(ImageErrorCode.USER_IMAGES_ALREADY_EXIST);
-        }
-
         String originalFilename = file.getOriginalFilename();
         String ext = StringUtils.getFilenameExtension(originalFilename);
         if (ext == null) ext = "jpg";
 
         String uuid = UUID.randomUUID().toString().replace("-", "");
-
         String key = "users/%d/profile.%s.%s".formatted(userId, uuid, ext);
+        Optional<Image> existingOpt =
+                imageRepository.findFirstByImageTypeAndRelatedIdOrderByOrderIndexAsc(ImageType.USER, userId);
+        String oldKey = existingOpt
+                .map(Image::getUrl)
+                .filter(url -> !storageClient.isDefaultUrlOrKey(url))
+                .map(url -> toKeyFromUrlOrKey(endPoint, bucket, cdnBaseUrl, url))
+                .orElse(null);
 
+        ImageOperationService.UploadOperationPlan uploadPlan = imageOperationService.createUploadOperation(
+                ImageOperationType.UPLOAD_USER_PROFILE_IMAGE,
+                ImageOperationOwnerType.USER,
+                userId,
+                key
+        );
+        imageOperationService.markProcessing(uploadPlan.operationId());
+        imageOperationStepService.markProcessing(uploadPlan.stepId());
         try {
             PutObjectRequest putObjectRequest = PutObjectRequest.builder()
                     .bucket(bucket)
-                    .key(key)
+                    .key(uploadPlan.targetKey())
                     .acl(ObjectCannedACL.PUBLIC_READ)
                     .contentType(file.getContentType())
                     .cacheControl("public, max-age=31536000, immutable")
                     .build();
 
-            s3Client.putObject(putObjectRequest, RequestBody.fromBytes(file.getBytes()));
-
+            PutObjectResponse response = s3Client.putObject(putObjectRequest, RequestBody.fromBytes(file.getBytes()));
+            imageOperationStepService.markCompleted(uploadPlan.stepId(), validatePutObjectResponse(response));
         } catch (Exception e) {
+            imageOperationStepService.markTerminalFailed(uploadPlan.stepId(), e.getMessage());
+            imageOperationService.markFailed(uploadPlan.operationId());
+            createCompensation(uploadPlan.operationId(), uploadPlan.targetKey());
             log.error("Profile Image Direct Upload Failed userId={}", userId, e);
             throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
         }
 
-        saveImageInDB(userId, ImageType.USER, key);
+        try {
+            upsertProfileImageEntityAndFlush(userId, ImageType.USER, existingOpt, uploadPlan.targetKey());
+        } catch (RuntimeException e) {
+            createCompensation(uploadPlan.operationId(), uploadPlan.targetKey());
+            throw e;
+        }
+
+        scheduleDirectUploadCleanupAndRollbackCompensation(userId, oldKey, uploadPlan);
     }
 
 
@@ -367,16 +477,16 @@ public class ProfileImageServiceImpl implements ProfileImageService {
         return reqKey;
     }
 
-    private void validateImageHeadIfNecessary(RequestInfo requestInfo) {
+    private HeadObjectResponse validateImageHeadIfNecessary(RequestInfo requestInfo) {
         if (requestInfo.isDefaultIncoming()) {
             log.info("[헤더검사 - skip] 기본 이미지이므로 헤더 검사를 생략합니다.");
-            return;
+            return null;
         }
         log.info("[헤더검사 - 시작] Key: {}", requestInfo.getReqKey());
-        validateImageHeadOrThrow(requestInfo.getReqKey(), PROFILE_MAX_BYTES);
+        return validateImageHeadOrThrow(requestInfo.getReqKey(), PROFILE_MAX_BYTES);
     }
 
-    private void validateImageHeadOrThrow(String key, long maxBytes) {
+    private HeadObjectResponse validateImageHeadOrThrow(String key, long maxBytes) {
         HeadObjectResponse head = storageClient.headObject(key);
         long size = head.contentLength();
         String ct = Optional.ofNullable(head.contentType()).orElse("").toLowerCase();
@@ -392,6 +502,287 @@ public class ProfileImageServiceImpl implements ProfileImageService {
             throw new BusinessException(ImageErrorCode.IMAGE_FILE_UPLOAD_TYPE_ERROR);
         }
         log.info("[헤더검사 성공]");
+        return head;
+    }
+
+    private ImageOperationService.CopyOperationPlan copyProfileImage(
+            ImageOperationType operationType,
+            Long userId,
+            RequestInfo requestInfo,
+            String targetKey,
+            HeadObjectResponse sourceHead
+    ) {
+        ImageOperationService.CopyOperationPlan plan = imageOperationService.createCopyOperation(
+                operationType,
+                ImageOperationOwnerType.USER,
+                userId,
+                requestInfo.getReqKey(),
+                targetKey,
+                sourceHead == null ? null : sourceHead.eTag(),
+                sourceHead == null ? null : sourceHead.contentLength()
+        );
+        imageOperationService.markProcessing(plan.operationId());
+        imageOperationStepService.markProcessing(plan.stepId());
+
+        try {
+            ImageCopyExecutor.ImageCopyResult result =
+                    imageCopyExecutor.copyProfile(requestInfo.getReqKey(), plan.targetKey());
+            imageOperationStepService.markCompleted(plan.stepId(), result.resultETag());
+            return plan;
+        } catch (RuntimeException e) {
+            imageOperationStepService.markTerminalFailed(plan.stepId(), e.getMessage());
+            imageOperationService.markFailed(plan.operationId());
+            throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
+        }
+    }
+
+    private ImageOperationService.CopyOperationPlan copyChatRoomProfileImage(
+            ImageOperationType operationType,
+            Long chatRoomId,
+            RequestInfo requestInfo,
+            String targetKey,
+            HeadObjectResponse sourceHead
+    ) {
+        ImageOperationService.CopyOperationPlan plan = imageOperationService.createCopyOperation(
+                operationType,
+                ImageOperationOwnerType.CHAT_ROOM,
+                chatRoomId,
+                requestInfo.getReqKey(),
+                targetKey,
+                sourceHead == null ? null : sourceHead.eTag(),
+                sourceHead == null ? null : sourceHead.contentLength()
+        );
+        imageOperationService.markProcessing(plan.operationId());
+        imageOperationStepService.markProcessing(plan.stepId());
+
+        try {
+            ImageCopyExecutor.ImageCopyResult result =
+                    imageCopyExecutor.copy(requestInfo.getReqKey(), plan.targetKey());
+            imageOperationStepService.markCompleted(plan.stepId(), result.resultETag());
+            return plan;
+        } catch (RuntimeException e) {
+            imageOperationStepService.markTerminalFailed(plan.stepId(), e.getMessage());
+            imageOperationService.markFailed(plan.operationId());
+            throw new BusinessException(ImageErrorCode.IMAGE_UPLOAD_FAILED);
+        }
+    }
+
+    private void scheduleCleanupAndRollbackCompensation(
+            ImageOperationOwnerType ownerType,
+            Long ownerId,
+            String previousKey,
+            RequestInfo requestInfo,
+            String finalKey,
+            ImageOperationService.CopyOperationPlan copyPlan
+    ) {
+        String oldKey = java.util.Objects.equals(previousKey, finalKey) ? null : previousKey;
+        String stagingKey = requestInfo.isStaging() ? requestInfo.getReqKey() : null;
+        List<String> cleanupKeys = java.util.stream.Stream.of(oldKey, stagingKey)
+                .filter(java.util.Objects::nonNull)
+                .filter(key -> !storageClient.isDefaultUrlOrKey(key))
+                .distinct()
+                .toList();
+
+        if (TransactionSynchronizationManager.isSynchronizationActive() && copyPlan != null) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                        createCompensation(copyPlan, finalKey);
+                    }
+                }
+            });
+        }
+
+        if (!imageOperationRabbitEnabled) {
+            scheduleDirectCleanupFallback(cleanupKeys, copyPlan == null ? null : copyPlan.operationId());
+            return;
+        }
+
+        imageOperationRecoveryService.scheduleDeleteObjects(
+                copyPlan == null ? null : copyPlan.operationId(),
+                ownerType,
+                ownerId,
+                cleanupKeys
+        );
+    }
+
+    private void scheduleDirectCleanupFallback(
+            List<String> cleanupKeys,
+            UUID operationId
+    ) {
+        Runnable cleanup = () -> {
+            try {
+                storageClient.deleteObjectsBulk(cleanupKeys);
+            } catch (RuntimeException e) {
+                log.error("[UPI] direct cleanup fallback failed keys={}", cleanupKeys, e);
+            }
+            if (operationId != null) {
+                try {
+                    imageOperationService.markCompleted(operationId);
+                } catch (RuntimeException e) {
+                    log.error("[UPI] operation completion record failed operationId={}",
+                            operationId, e);
+                }
+            }
+        };
+
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            cleanup.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                cleanup.run();
+            }
+        });
+    }
+
+    private String upsertProfileImageAndFlush(
+            Long relatedId,
+            ImageType imageType,
+            Optional<Image> existingOpt,
+            String finalKey
+    ) {
+        upsertProfileImageEntityAndFlush(relatedId, imageType, existingOpt, finalKey);
+        return buildCdnUrlFromKey(cdnBaseUrl, finalKey);
+    }
+
+    private Image upsertProfileImageEntityAndFlush(
+            Long relatedId,
+            ImageType imageType,
+            Optional<Image> existingOpt,
+            String finalKey
+    ) {
+        String finalUrl = buildCdnUrlFromKey(cdnBaseUrl, finalKey);
+        Image image;
+        if (existingOpt.isPresent()) {
+            image = existingOpt.get();
+            image.updateUrl(finalUrl);
+        } else {
+            image = imageRepository.save(
+                    Image.of(imageType, relatedId, finalUrl, 0, ImageModerationStatus.CLEAN, null)
+            );
+        }
+        imageRepository.flush();
+        return image;
+    }
+
+    private void scheduleFolderCleanup(
+            ImageOperationOwnerType ownerType,
+            Long ownerId,
+            String folder
+    ) {
+        if (imageOperationRabbitEnabled) {
+            imageOperationRecoveryService.scheduleDeleteFolder(ownerType, ownerId, folder);
+            return;
+        }
+
+        Runnable cleanup = () -> {
+            try {
+                storageClient.deleteFolder(folder);
+            } catch (RuntimeException e) {
+                log.error("[ImageCleanup] direct folder cleanup fallback failed folder={}", folder, e);
+            }
+        };
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            cleanup.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                cleanup.run();
+            }
+        });
+    }
+
+    private void scheduleDirectUploadCleanupAndRollbackCompensation(
+            Long userId,
+            String oldKey,
+            ImageOperationService.UploadOperationPlan uploadPlan
+    ) {
+        List<String> cleanupKeys = oldKey == null ? List.of() : List.of(oldKey);
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                        createCompensation(uploadPlan.operationId(), uploadPlan.targetKey());
+                    }
+                }
+            });
+        }
+
+        if (!imageOperationRabbitEnabled) {
+            scheduleDirectCleanupFallback(cleanupKeys, uploadPlan.operationId());
+            return;
+        }
+
+        if (!cleanupKeys.isEmpty()) {
+            imageOperationRecoveryService.scheduleDeleteObjects(
+                    uploadPlan.operationId(),
+                    ImageOperationOwnerType.USER,
+                    userId,
+                    cleanupKeys
+            );
+            return;
+        }
+
+        markOperationCompletedAfterCommit(uploadPlan.operationId());
+    }
+
+    private void markOperationCompletedAfterCommit(UUID operationId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            imageOperationService.markCompleted(operationId);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                imageOperationService.markCompleted(operationId);
+            }
+        });
+    }
+
+    private String validatePutObjectResponse(PutObjectResponse response) {
+        if (response == null
+                || response.sdkHttpResponse() == null
+                || !response.sdkHttpResponse().isSuccessful()
+                || response.eTag() == null
+                || response.eTag().isBlank()) {
+            throw new IllegalStateException("Object Storage put response did not confirm success");
+        }
+        return response.eTag();
+    }
+
+    private void createCompensation(
+            ImageOperationService.CopyOperationPlan copyPlan,
+            String finalKey
+    ) {
+        createCompensation(copyPlan.operationId(), finalKey);
+    }
+
+    private void createCompensation(UUID operationId, String finalKey) {
+        if (!imageOperationRabbitEnabled) {
+            try {
+                imageOperationService.markFailed(operationId);
+                storageClient.deleteObjectsBulk(List.of(finalKey));
+                imageOperationService.markCompensated(operationId);
+            } catch (RuntimeException compensationError) {
+                log.error("[UPI] direct compensation failed operationId={} targetKey={}",
+                        operationId, finalKey, compensationError);
+            }
+            return;
+        }
+
+        try {
+            imageOperationRecoveryService.scheduleCompensation(operationId, finalKey);
+        } catch (RuntimeException compensationError) {
+            log.error("[UPI] compensation record failed operationId={} targetKey={}",
+                    operationId, finalKey, compensationError);
+        }
     }
 
     private boolean isNoOp(Optional<Image> existingOpt, String candidateFinalUrl) {

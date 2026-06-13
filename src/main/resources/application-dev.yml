@@ -415,4 +415,8 @@ server:
     # 요청 처리 타임아웃 (무한 대기 방지)
     connection-timeout: 20000
 
-
+image:
+  cleanup:
+    retry:
+      fixed-delay: PT5M
+      initial-delay: PT1M

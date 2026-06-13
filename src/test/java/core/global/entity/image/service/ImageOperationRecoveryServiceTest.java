@@ -1,0 +1,540 @@
+package core.global.entity.image.service;
+
+import core.global.entity.image.entity.ImageOperation;
+import core.global.entity.image.entity.ImageOperationPublishOutbox;
+import core.global.entity.image.entity.ImageOperationStep;
+import core.global.entity.image.repository.ImageOperationConsumedMessageRepository;
+import core.global.entity.image.repository.ImageOperationPublishOutboxRepository;
+import core.global.entity.image.repository.ImageOperationRepository;
+import core.global.entity.image.repository.ImageOperationStepRepository;
+import core.global.enums.common.*;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class ImageOperationRecoveryServiceTest {
+
+    @Mock
+    private ImageOperationRepository operationRepository;
+    @Mock
+    private ImageOperationStepRepository stepRepository;
+    @Mock
+    private ImageOperationPublishOutboxRepository outboxRepository;
+    @Mock
+    private ImageOperationConsumedMessageRepository consumedMessageRepository;
+
+    @InjectMocks
+    private ImageOperationRecoveryService recoveryService;
+
+    private ImageOperation operation;
+    private ImageOperationStep compensationStep;
+
+    @BeforeEach
+    void setUp() {
+        operation = ImageOperation.create(
+                ImageOperationType.UPDATE_USER_PROFILE_IMAGE,
+                ImageOperationOwnerType.USER,
+                10L
+        );
+        operation.markProcessing();
+        compensationStep = ImageOperationStep.createCompensationStep(
+                operation.getOperationId(),
+                "users/10/profile.jpg",
+                5
+        );
+    }
+
+    @Test
+    @DisplayName("보상 step과 초기 Outbox를 함께 생성하고 operation을 FAILED 처리한다")
+    void scheduleCompensation_createsStepAndOutbox() {
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+        when(stepRepository.findByOperationIdAndStepTypeAndTargetKey(
+                operation.getOperationId(),
+                ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                compensationStep.getTargetKey()
+        )).thenReturn(Optional.empty());
+        when(stepRepository.save(any())).thenReturn(compensationStep);
+
+        recoveryService.scheduleCompensation(operation.getOperationId(), compensationStep.getTargetKey());
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.INITIAL);
+        assertThat(captor.getValue().getStepId()).isEqualTo(compensationStep.getStepId());
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.FAILED);
+    }
+
+    @Test
+    @DisplayName("보상 실패 시 step을 RETRY_WAITING으로 바꾸고 retry Outbox를 생성한다")
+    void markFailedAndSchedule_createsRetryOutbox() {
+        compensationStep.markProcessing();
+        ImageOperationRecoveryService.ImageOperationMessageView message = messageView(compensationStep, 0);
+        when(stepRepository.findById(compensationStep.getStepId())).thenReturn(Optional.of(compensationStep));
+
+        ImageOperationRecoveryService.FailureDecision decision =
+                recoveryService.markFailedAndSchedule(message, "storage unavailable");
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(decision.exhausted()).isFalse();
+        assertThat(decision.attempt()).isEqualTo(1);
+        assertThat(compensationStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.RETRY);
+        verify(consumedMessageRepository).insertIfAbsent(
+                message.messageId(), message.operationId(), message.stepId(), "image-operation-step-consumer"
+        );
+    }
+
+    @Test
+    @DisplayName("이미 소비된 message는 보상 작업을 시작하지 않는다")
+    void begin_skipsConsumedMessage() {
+        ImageOperationRecoveryService.ImageOperationMessageView message = messageView(compensationStep, 0);
+        when(consumedMessageRepository.existsById(message.messageId())).thenReturn(true);
+
+        assertThat(recoveryService.begin(message)).isFalse();
+        verifyNoInteractions(stepRepository);
+    }
+
+    @Test
+    @DisplayName("기존 operation에 DELETE_OBJECT step과 초기 Outbox를 생성한다")
+    void scheduleDeleteObjects_addsCleanupStepsToExistingOperation() {
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+        when(stepRepository.findByOperationIdAndStepTypeAndTargetKey(
+                eq(operation.getOperationId()),
+                eq(ImageOperationStepType.DELETE_OBJECT),
+                anyString()
+        )).thenReturn(Optional.empty());
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID result = recoveryService.scheduleDeleteObjects(
+                operation.getOperationId(),
+                ImageOperationOwnerType.USER,
+                10L,
+                List.of("users/10/old.jpg", "temp/profile.jpg", "temp/profile.jpg")
+        );
+
+        assertThat(result).isEqualTo(operation.getOperationId());
+        verify(stepRepository, times(2)).save(any());
+        verify(outboxRepository, times(2)).save(any());
+    }
+
+    @Test
+    @DisplayName("기존 operation이 없으면 CLEANUP_ONLY operation을 생성한다")
+    void scheduleDeleteObjects_createsCleanupOnlyOperation() {
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.findByOperationIdAndStepTypeAndTargetKey(any(), any(), anyString()))
+                .thenReturn(Optional.empty());
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID operationId = recoveryService.scheduleDeleteObjects(
+                null,
+                ImageOperationOwnerType.USER,
+                10L,
+                List.of("users/10/old.jpg")
+        );
+
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        assertThat(operationId).isEqualTo(operationCaptor.getValue().getOperationId());
+        assertThat(operationCaptor.getValue().getOperationType()).isEqualTo(ImageOperationType.CLEANUP_ONLY);
+        assertThat(operationCaptor.getValue().getStatus()).isEqualTo(ImageOperationStatus.PROCESSING);
+    }
+
+    @Test
+    @DisplayName("삭제 대상이 없으면 cleanup operation을 생성하지 않는다")
+    void scheduleDeleteObjects_skipsEmptyTargets() {
+        UUID result = recoveryService.scheduleDeleteObjects(
+                null,
+                ImageOperationOwnerType.USER,
+                10L,
+                List.of()
+        );
+
+        assertThat(result).isNull();
+        verifyNoInteractions(operationRepository, stepRepository, outboxRepository);
+    }
+
+    @Test
+    @DisplayName("미등록 Post object는 기존 삭제 step이 없는 key만 cleanup Outbox로 예약한다")
+    void scheduleUnregisteredPostObjectDeletes_skipsAlreadyTrackedKeys() {
+        ImageOperationStep tracked = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "posts/objects/tracked.jpg",
+                5
+        );
+        when(stepRepository.findByStepTypeAndTargetKeyInAndStatusIn(
+                ImageOperationStepType.DELETE_OBJECT,
+                List.of("posts/objects/tracked.jpg", "posts/objects/new.jpg"),
+                List.of(
+                        ImageOperationStepStatus.PENDING,
+                        ImageOperationStepStatus.PROCESSING,
+                        ImageOperationStepStatus.RETRY_WAITING
+                )
+        )).thenReturn(List.of(tracked));
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        int scheduled = recoveryService.scheduleUnregisteredPostObjectDeletes(
+                List.of("posts/objects/tracked.jpg", "posts/objects/new.jpg", "temp/ignored.jpg")
+        );
+
+        assertThat(scheduled).isEqualTo(1);
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        verify(stepRepository).save(stepCaptor.capture());
+        verify(outboxRepository).save(any());
+        assertThat(operationCaptor.getValue().getOwnerType()).isEqualTo(ImageOperationOwnerType.SYSTEM);
+        assertThat(operationCaptor.getValue().getOwnerId()).isZero();
+        assertThat(stepCaptor.getValue().getTargetKey()).isEqualTo("posts/objects/new.jpg");
+    }
+
+    @Test
+    @DisplayName("DELETE_FOLDER cleanup operation과 초기 Outbox를 생성한다")
+    void scheduleDeleteFolder_createsCleanupOperation() {
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID operationId = recoveryService.scheduleDeleteFolder(
+                ImageOperationOwnerType.USER,
+                10L,
+                "users/10/"
+        );
+
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        ArgumentCaptor<ImageOperationPublishOutbox> outboxCaptor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        verify(stepRepository).save(stepCaptor.capture());
+        verify(outboxRepository).save(outboxCaptor.capture());
+        assertThat(operationId).isEqualTo(operationCaptor.getValue().getOperationId());
+        assertThat(operationCaptor.getValue().getOperationType()).isEqualTo(ImageOperationType.CLEANUP_ONLY);
+        assertThat(operationCaptor.getValue().getStatus()).isEqualTo(ImageOperationStatus.PROCESSING);
+        assertThat(stepCaptor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+        assertThat(stepCaptor.getValue().getTargetKey()).isEqualTo("users/10/");
+        assertThat(outboxCaptor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+    }
+
+    @Test
+    @DisplayName("FailedImageCleanup DELETE_FOLDER를 공통 CLEANUP_ONLY operation과 Outbox로 예약한다")
+    void scheduleFailedCleanup_createsDeleteFolderOperation() {
+        when(stepRepository.findFirstByStepTypeAndTargetKeyOrderByCreatedAtDesc(
+                ImageOperationStepType.DELETE_FOLDER,
+                "posts/1/"
+        )).thenReturn(Optional.empty());
+        when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        UUID operationId = recoveryService.scheduleFailedCleanup(
+                99L,
+                ImageCleanupOperationType.DELETE_FOLDER,
+                "posts/1/"
+        );
+
+        ArgumentCaptor<ImageOperation> operationCaptor = ArgumentCaptor.forClass(ImageOperation.class);
+        ArgumentCaptor<ImageOperationStep> stepCaptor = ArgumentCaptor.forClass(ImageOperationStep.class);
+        verify(operationRepository).save(operationCaptor.capture());
+        verify(stepRepository).save(stepCaptor.capture());
+        verify(outboxRepository).save(any());
+        assertThat(operationId).isEqualTo(operationCaptor.getValue().getOperationId());
+        assertThat(operationCaptor.getValue().getOperationType()).isEqualTo(ImageOperationType.CLEANUP_ONLY);
+        assertThat(operationCaptor.getValue().getOwnerType()).isEqualTo(ImageOperationOwnerType.IMAGE);
+        assertThat(operationCaptor.getValue().getOwnerId()).isEqualTo(99L);
+        assertThat(stepCaptor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+    }
+
+    @Test
+    @DisplayName("동일 target의 공통 cleanup step이 진행 중이면 중복 operation을 생성하지 않는다")
+    void scheduleFailedCleanup_reusesActiveStep() {
+        ImageOperationStep activeStep = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "posts/1/a.jpg",
+                5
+        );
+        when(stepRepository.findFirstByStepTypeAndTargetKeyOrderByCreatedAtDesc(
+                ImageOperationStepType.DELETE_OBJECT,
+                "posts/1/a.jpg"
+        )).thenReturn(Optional.of(activeStep));
+
+        UUID operationId = recoveryService.scheduleFailedCleanup(
+                99L,
+                ImageCleanupOperationType.DELETE_OBJECT,
+                "posts/1/a.jpg"
+        );
+
+        assertThat(operationId).isEqualTo(operation.getOperationId());
+        verifyNoInteractions(operationRepository, outboxRepository);
+    }
+
+    @Test
+    @DisplayName("마지막 DELETE_OBJECT 완료 시 operation을 COMPLETED 처리한다")
+    void markCompleted_marksCleanupOperationCompleted() {
+        ImageOperationStep cleanupStep = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "users/10/old.jpg",
+                5
+        );
+        cleanupStep.markProcessing();
+        ImageOperationRecoveryService.ImageOperationMessageView message = messageView(cleanupStep, 0);
+        when(stepRepository.findById(cleanupStep.getStepId())).thenReturn(Optional.of(cleanupStep));
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+        when(stepRepository.existsByOperationIdAndStatusNot(
+                operation.getOperationId(),
+                ImageOperationStepStatus.COMPLETED
+        )).thenReturn(false);
+
+        recoveryService.markCompleted(message);
+
+        assertThat(cleanupStep.getStatus()).isEqualTo(ImageOperationStepStatus.COMPLETED);
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.COMPLETED);
+    }
+
+    @Test
+    @DisplayName("보상 삭제 완료 시 step과 operation을 각각 COMPLETED와 COMPENSATED 처리한다")
+    void markCompleted_marksOperationCompensated() {
+        operation.markFailed();
+        compensationStep.markProcessing();
+        ImageOperationRecoveryService.ImageOperationMessageView message = messageView(compensationStep, 0);
+        when(stepRepository.findById(compensationStep.getStepId())).thenReturn(Optional.of(compensationStep));
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+
+        recoveryService.markCompleted(message);
+
+        assertThat(compensationStep.getStatus()).isEqualTo(ImageOperationStepStatus.COMPLETED);
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.COMPENSATED);
+        verify(consumedMessageRepository).insertIfAbsent(
+                message.messageId(), message.operationId(), message.stepId(), "image-operation-step-consumer"
+        );
+    }
+
+    @Test
+    @DisplayName("오래된 PROCESSING 보상 삭제 step을 RETRY_WAITING으로 복구하고 retry Outbox를 생성한다")
+    void recoverTimedOutDeleteSteps_schedulesCompensationRetry() {
+        compensationStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(compensationStep));
+
+        int recovered = recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(recovered).isEqualTo(1);
+        assertThat(compensationStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(compensationStep.getAttemptCount()).isEqualTo(1);
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.RETRY);
+    }
+
+    @Test
+    @DisplayName("오래된 PROCESSING 정상 cleanup DELETE_OBJECT도 RETRY_WAITING으로 복구한다")
+    void recoverTimedOutDeleteSteps_schedulesCleanupRetry() {
+        ImageOperationStep cleanupStep = ImageOperationStep.createDeleteObjectStep(
+                operation.getOperationId(),
+                "users/10/old.jpg",
+                5
+        );
+        cleanupStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(cleanupStep));
+
+        int recovered = recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(recovered).isEqualTo(1);
+        assertThat(cleanupStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(captor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_OBJECT);
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.RETRY);
+    }
+
+    @Test
+    @DisplayName("오래된 PROCESSING DELETE_FOLDER도 RETRY_WAITING으로 복구한다")
+    void recoverTimedOutDeleteSteps_schedulesFolderRetry() {
+        ImageOperationStep folderStep = ImageOperationStep.createDeleteFolderStep(
+                operation.getOperationId(),
+                "posts/1/",
+                5
+        );
+        folderStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(folderStep));
+
+        recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(folderStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(captor.getValue().getStepType()).isEqualTo(ImageOperationStepType.DELETE_FOLDER);
+    }
+
+    @Test
+    @DisplayName("timeout 복구 중 재시도 한도를 소진하면 step과 operation을 DLQ 처리한다")
+    void recoverTimedOutDeleteSteps_movesExhaustedStepToDlq() {
+        ImageOperationStep exhaustedStep = ImageOperationStep.createCompensationStep(
+                operation.getOperationId(),
+                "users/10/exhausted.jpg",
+                1
+        );
+        exhaustedStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(
+                        ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                        ImageOperationStepType.DELETE_STAGING,
+                        ImageOperationStepType.DELETE_OBJECT,
+                        ImageOperationStepType.DELETE_FOLDER
+                ),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(exhaustedStep));
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+
+        recoveryService.recoverTimedOutDeleteSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(exhaustedStep.getStatus()).isEqualTo(ImageOperationStepStatus.DLQ);
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.DLQ);
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.DLQ);
+    }
+
+    @Test
+    @DisplayName("오래된 PROCESSING Copy step을 retry Outbox로 복구한다")
+    void recoverTimedOutPipelineSteps_schedulesCopyRetry() {
+        ImageOperationStep copyStep = ImageOperationStep.createCopyStep(
+                operation.getOperationId(),
+                "temp/a.jpg",
+                "posts/10/000_a.jpg",
+                null,
+                null,
+                5
+        );
+        copyStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(ImageOperationStepType.COPY_STAGING_TO_FINAL, ImageOperationStepType.REGISTER_IMAGE_DB),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(copyStep));
+
+        int recovered = recoveryService.recoverTimedOutPipelineSteps(timedOutBefore);
+
+        ArgumentCaptor<ImageOperationPublishOutbox> captor =
+                ArgumentCaptor.forClass(ImageOperationPublishOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        assertThat(recovered).isEqualTo(1);
+        assertThat(copyStep.getStatus()).isEqualTo(ImageOperationStepStatus.RETRY_WAITING);
+        assertThat(captor.getValue().getStepType()).isEqualTo(ImageOperationStepType.COPY_STAGING_TO_FINAL);
+        assertThat(captor.getValue().getDestination()).isEqualTo(ImageOperationMessageDestination.RETRY);
+    }
+
+    @Test
+    @DisplayName("Copy timeout 재시도 한도 소진 시 DLQ와 보상 삭제를 함께 예약한다")
+    void recoverTimedOutPipelineSteps_schedulesCompensationWhenExhausted() {
+        ImageOperationStep copyStep = ImageOperationStep.createCopyStep(
+                operation.getOperationId(),
+                "temp/a.jpg",
+                "posts/10/000_a.jpg",
+                null,
+                null,
+                1
+        );
+        copyStep.markProcessing();
+        LocalDateTime timedOutBefore = LocalDateTime.now();
+        when(stepRepository.findTop50ByStepTypeInAndStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                List.of(ImageOperationStepType.COPY_STAGING_TO_FINAL, ImageOperationStepType.REGISTER_IMAGE_DB),
+                ImageOperationStepStatus.PROCESSING,
+                timedOutBefore
+        )).thenReturn(List.of(copyStep));
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+        when(stepRepository.findByOperationIdAndStepTypeAndTargetKey(
+                operation.getOperationId(),
+                ImageOperationStepType.COMPENSATE_FINAL_OBJECT,
+                copyStep.getTargetKey()
+        )).thenReturn(Optional.empty());
+        when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        recoveryService.recoverTimedOutPipelineSteps(timedOutBefore);
+
+        assertThat(copyStep.getStatus()).isEqualTo(ImageOperationStepStatus.DLQ);
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.DLQ);
+        verify(outboxRepository, times(2)).save(any());
+    }
+
+    @Test
+    @DisplayName("timeout 복구 후 기존 삭제 호출이 늦게 성공해도 최종 보상 완료로 인정한다")
+    void markCompleted_acceptsLateSuccessAfterTimeoutRecovery() {
+        operation.markFailed();
+        compensationStep.markProcessing();
+        compensationStep.markFailed("Compensation processing timeout");
+        ImageOperationRecoveryService.ImageOperationMessageView message = messageView(compensationStep, 0);
+        when(stepRepository.findById(compensationStep.getStepId())).thenReturn(Optional.of(compensationStep));
+        when(operationRepository.findById(operation.getOperationId())).thenReturn(Optional.of(operation));
+
+        recoveryService.markCompleted(message);
+
+        assertThat(compensationStep.getStatus()).isEqualTo(ImageOperationStepStatus.COMPLETED);
+        assertThat(operation.getStatus()).isEqualTo(ImageOperationStatus.COMPENSATED);
+    }
+
+    private ImageOperationRecoveryService.ImageOperationMessageView messageView(
+            ImageOperationStep step,
+            int attempt
+    ) {
+        return new ImageOperationRecoveryService.ImageOperationMessageView(
+                UUID.randomUUID(),
+                step.getOperationId(),
+                step.getStepId(),
+                step.getStepType(),
+                step.getTargetKey(),
+                attempt
+        );
+    }
+}

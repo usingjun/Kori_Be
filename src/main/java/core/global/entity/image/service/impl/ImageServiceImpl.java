@@ -6,12 +6,17 @@ import core.global.entity.image.dto.PresignedUrlRequest;
 import core.global.entity.image.dto.PresignedUrlResponse;
 import core.global.entity.image.service.ImageService;
 import core.global.entity.image.service.ImageStorageClient;
+import core.global.entity.image.service.ImagePersistenceTransactionService;
+import core.global.entity.image.service.PostImageOperationPipelineService;
 import core.global.entity.image.service.PostImageService;
 import core.global.entity.image.service.ProfileImageService;
 import core.global.enums.PollType;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -25,6 +30,11 @@ public class ImageServiceImpl implements ImageService {
     private final ProfileImageService profileImageService;
     private final ImageStorageClient imageStorageClient;
     private final MainContentImageService mainContentImageService;
+    private final PostImageOperationPipelineService postImageOperationPipelineService;
+    private final ImagePersistenceTransactionService imagePersistenceTransactionService;
+
+    @Value("${image.cleanup.rabbit.enabled:false}")
+    private boolean imageOperationRabbitEnabled;
 
     @Override
     public List<PresignedUrlResponse> generatePresignedUrls(PresignedUrlRequest request) {
@@ -32,15 +42,35 @@ public class ImageServiceImpl implements ImageService {
     }
 
     @Override
-    @Transactional
     public void savePostImages(Long postId, List<String> toAdd) {
-        postImageService.savePostImages(postId, toAdd);
+        List<String> adds = copyNullableList(toAdd);
+        if (usesFinalPostKeys(adds)) {
+            imagePersistenceTransactionService.validateFinalPostImages(adds);
+            imagePersistenceTransactionService.saveFinalPostImages(postId, adds);
+            return;
+        }
+        if (imageOperationRabbitEnabled) {
+            postImageOperationPipelineService.scheduleCreate(postId, adds);
+            return;
+        }
+        runAfterCommit(() -> postImageService.savePostImages(postId, adds));
     }
 
     @Override
-    @Transactional
     public void updatePostImages(Long postId, List<String> toAdd, List<String> toRemove) {
-        postImageService.updatePostImages(postId, toAdd, toRemove);
+        List<String> adds = copyNullableList(toAdd);
+        List<String> removes = copyNullableList(toRemove);
+        if (usesFinalPostKeys(adds)) {
+            imagePersistenceTransactionService.validateFinalPostImages(adds);
+            imagePersistenceTransactionService.updateFinalPostImages(postId, adds, removes);
+            return;
+        }
+        runAfterCommit(() -> postImageService.updatePostImages(postId, adds, removes));
+    }
+
+    @Override
+    public void deletePostImages(Long postId) {
+        imagePersistenceTransactionService.deletePostImages(postId);
     }
 
     @Override
@@ -100,15 +130,39 @@ public class ImageServiceImpl implements ImageService {
         postImageService.uploadAndSavePostImages(post, multipartFiles);
     }
 
-    @Transactional
     @Override
     public void upsertPollImages(Long id, List<String> addImageUrls, List<String> removeImageUrls, PollType type) {
-        mainContentImageService.upsertPollImages(id, addImageUrls, removeImageUrls, type);
+        List<String> adds = copyNullableList(addImageUrls);
+        List<String> removes = copyNullableList(removeImageUrls);
+        runAfterCommit(() -> mainContentImageService.upsertPollImages(id, adds, removes, type));
     }
 
     @Override
     @Transactional
     public void deleteFolder(String fileLocation) {
         imageStorageClient.deleteFolder(fileLocation);
+    }
+
+    private List<String> copyNullableList(List<String> values) {
+        return values == null ? List.of() : List.copyOf(values);
+    }
+
+    private boolean usesFinalPostKeys(List<String> values) {
+        return values.stream().allMatch(value ->
+                value != null && (value.startsWith("posts/objects/") || value.contains("/posts/objects/"))
+        );
+    }
+
+    private void runAfterCommit(Runnable action) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            action.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                action.run();
+            }
+        });
     }
 }
