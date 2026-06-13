@@ -90,6 +90,9 @@ class ImageServiceImplTest {
         verify(imagePersistenceTransactionService).updateFinalPostImages(
                 10L, List.of("posts/objects/new.jpg"), List.of("posts/10/old.jpg")
         );
+        verify(imagePersistenceTransactionService).validateFinalPostImages(
+                List.of("posts/objects/new.jpg")
+        );
         verify(postImageService, never()).updatePostImages(
                 10L, List.of("posts/objects/new.jpg"), List.of("posts/10/old.jpg")
         );
@@ -121,6 +124,9 @@ class ImageServiceImplTest {
 
         verify(imagePersistenceTransactionService).saveFinalPostImages(
                 10L, List.of("posts/objects/new.jpg")
+        );
+        verify(imagePersistenceTransactionService).validateFinalPostImages(
+                List.of("posts/objects/new.jpg")
         );
         verify(postImageOperationPipelineService, never()).scheduleCreate(
                 10L, List.of("posts/objects/new.jpg")

@@ -173,6 +173,18 @@ class ImagePersistenceTransactionServiceTest {
     }
 
     @Test
+    void validateFinalPostImagesChecksEachDistinctObjectOutsidePersistence() {
+        service.validateFinalPostImages(List.of(
+                "posts/objects/a.jpg",
+                "posts/objects/a.jpg",
+                "https://cdn.example.com/posts/objects/b.jpg"
+        ));
+
+        verify(storageClient).headObject("posts/objects/a.jpg");
+        verify(storageClient).headObject("posts/objects/b.jpg");
+    }
+
+    @Test
     void saveFinalPostImagesRejectsKeyAlreadyScheduledForCleanup() {
         when(imageRepository.existsByImageTypeAndRelatedId(ImageType.POST, 10L)).thenReturn(false);
         doThrow(new BusinessException(core.global.enums.errorcode.ImageErrorCode.IMAGE_UPLOAD_FAILED))

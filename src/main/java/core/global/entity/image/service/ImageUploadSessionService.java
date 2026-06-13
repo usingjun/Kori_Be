@@ -33,6 +33,15 @@ public class ImageUploadSessionService {
     @Value("${image.upload-session.retention:PT24H}")
     private Duration retention;
 
+    @Value("${image.upload-session.delete-failed-retry-delay:PT1H}")
+    private Duration deleteFailedRetryDelay;
+
+    @Value("${image.upload-session.registered-retention:P90D}")
+    private Duration registeredRetention;
+
+    @Value("${image.upload-session.deleted-retention:P30D}")
+    private Duration deletedRetention;
+
     @Transactional
     public void issue(String objectKey, Long ownerId, ImageType imageType) {
         sessionRepository.save(ImageUploadSession.issue(
@@ -85,8 +94,8 @@ public class ImageUploadSessionService {
     @Transactional
     public int scheduleExpiredSessions() {
         List<ImageUploadSession> sessions =
-                sessionRepository.findTop200ByStatusAndExpiresAtBeforeOrderByExpiresAtAsc(
-                        ImageUploadSessionStatus.ISSUED,
+                sessionRepository.findTop200ByStatusInAndExpiresAtBeforeOrderByExpiresAtAsc(
+                        List.of(ImageUploadSessionStatus.ISSUED),
                         LocalDateTime.now()
                 );
         if (sessions.isEmpty()) {
@@ -105,7 +114,7 @@ public class ImageUploadSessionService {
                 .filter(session -> {
                     String publicUrl = storageClient.generatePublicUrl(session.getObjectKey());
                     if (registeredUrls.contains(publicUrl)) {
-                        session.markRegistered();
+                        session.markRegisteredFromObservedUsage();
                         return false;
                     }
                     session.markDeletePending();
@@ -115,6 +124,32 @@ public class ImageUploadSessionService {
                 .toList();
         recoveryService.scheduleUnregisteredPostObjectDeletes(deleteKeys);
         return deleteKeys.size();
+    }
+
+    @Transactional
+    public int retryFailedDeletes() {
+        List<ImageUploadSession> sessions =
+                sessionRepository.findTop100ByStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                        ImageUploadSessionStatus.DELETE_FAILED,
+                        LocalDateTime.now().minus(deleteFailedRetryDelay)
+                );
+        sessions.forEach(ImageUploadSession::markDeletePending);
+        return recoveryService.scheduleUnregisteredPostObjectDeletes(
+                sessions.stream().map(ImageUploadSession::getObjectKey).toList()
+        );
+    }
+
+    @Transactional
+    public long purgeTerminalSessions() {
+        int deleted = sessionRepository.deleteTerminalSessions(
+                ImageUploadSessionStatus.DELETED,
+                LocalDateTime.now().minus(deletedRetention)
+        );
+        int registered = sessionRepository.deleteTerminalSessions(
+                ImageUploadSessionStatus.REGISTERED,
+                LocalDateTime.now().minus(registeredRetention)
+        );
+        return deleted + registered;
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)

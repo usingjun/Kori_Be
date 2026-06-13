@@ -25,4 +25,14 @@ class UnregisteredPostImageCleanupSchedulerTest {
 
         verify(uploadSessionService).scheduleExpiredSessions();
     }
+
+    @Test
+    void retryFailedDeletes_reschedulesFailedUploadSessionDeletes() {
+        when(uploadSessionService.retryFailedDeletes()).thenReturn(2);
+
+        scheduler.retryFailedDeletes();
+
+        verify(uploadSessionService).retryFailedDeletes();
+    }
+
 }

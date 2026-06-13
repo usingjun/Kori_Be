@@ -30,4 +30,16 @@ public class UnregisteredPostImageCleanupScheduler {
             log.info("[UnregisteredPostImageCleanup] scheduled={}", scheduled);
         }
     }
+
+    @Scheduled(
+            fixedDelayString = "${image.upload-session.delete-failed-retry-delay-ms:3600000}",
+            initialDelayString = "${image.upload-session.delete-failed-retry-initial-delay-ms:300000}"
+    )
+    public void retryFailedDeletes() {
+        int scheduled = uploadSessionService.retryFailedDeletes();
+        if (scheduled > 0) {
+            log.info("[UnregisteredPostImageCleanup] failed delete retry scheduled={}", scheduled);
+        }
+    }
+
 }

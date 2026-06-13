@@ -212,12 +212,29 @@ FailedImageCleanup 저장
 - Consumer 삭제 성공 시 `DELETED`, retry 한도 초과 시 `DELETE_FAILED`로 갱신한다.
 - 실제 삭제 직전 `Image.url` 재확인도 유지한다.
 
+### 19. Post 등록 시 직접 업로드 검증 및 session 유지보수
+
+- 별도 업로드 완료 API를 두지 않고 Post 등록 요청 자체를 업로드 완료 신호로 사용한다.
+- 신규 UUID final key 등록 전 `HeadObject`로 실제 object 존재를 확인한다.
+- `HeadObject` 검증은 `Propagation.NOT_SUPPORTED`로 상위 Post transaction을 잠시 중단한 상태에서 수행한다.
+- 검증 성공 후 Post transaction을 재개하고 session 소유권 확인과 `ISSUED → CLAIMED → REGISTERED` 전이를 수행한다.
+- 만료 정리는 `ISSUED`를 대상으로 수행한다.
+- `DELETE_FAILED` session은 기본 1시간 대기 후 새로운 `DELETE_OBJECT + Outbox`로 재처리한다.
+- 이전 삭제 step이 `DLQ`인 경우 새 cleanup operation을 생성하고, 활성 step이 있으면 중복 생성하지 않는다.
+- `DELETED` session은 기본 30일, `REGISTERED` session은 기본 90일 보존 후 DB에서 삭제한다.
+- terminal session 삭제 배치는 RabbitMQ 활성화 여부와 무관하게 실행된다.
+- 현재 운영 중인 서비스가 아니므로 session 없는 기존 Presigned URL을 임시 허용하는 단계적 활성화 기능은 구현하지 않았다.
+- k6 흐름은 기존처럼 PUT 성공 후 바로 Post 등록을 호출한다.
+- 최신 `./scripts/agent-check.sh`는 229개 중 18개 실패, 4개 skip이며, 실패 원인은 모두 기존 `pgroonga` extension 생성 권한 문제다.
+
 ## 현재 진행 중인 작업
 
-- Post 생성 이미지의 전체 재시도 파이프라인 구현을 완료했다.
+- 신규 Post/Poll 이미지는 UUID final key 직접 업로드 구조로 전환했다.
+- Post 등록 시 `HeadObject` 검증 후 `ISSUED → CLAIMED → REGISTERED` session 상태 추적을 구현했다.
+- 미등록 object 정리, `DELETE_FAILED` 재처리, terminal session 정리 배치를 구현했다.
 - 이미지 전체 회귀 테스트가 통과했다.
-- 실제 RabbitMQ/NCP 환경의 단계별 retry/DLQ 검증과 부하 재측정은 남아 있다.
-- 현재 구현 기준 Post 수정 전체 흐름은 `docs/agent/post-image-update-sequence.md`에 기록했다.
+- 실제 NCP 환경에서 Post 등록 시 `HeadObject`, 만료 정리, 삭제 실패 재처리 검증은 남아 있다.
+- staging Copy 구조에서 UUID final key 직접 업로드 구조로 전환한 전후 비교는 `docs/agent/post-image-flow-before-after.md`에 기록한다.
 
 ### 최초 구조와 최종 구조 성능 비교
 
@@ -250,10 +267,11 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 
 ### 가까운 범위
 
-- 실제 RabbitMQ 환경에서 Post 생성 `Copy → REGISTER_IMAGE_DB → DELETE_STAGING` 흐름 검증
-- Copy, DB 등록, staging 삭제 각각의 retry/DLQ 및 서버 재시작 복구 검증
-- Poll에 전체 재시도 파이프라인 확장
-- 최종 구조의 실제 NCP Copy benchmark 재측정
+- 실제 NCP 환경에서 `HeadObject → ISSUED → CLAIMED → REGISTERED` 흐름 검증
+- 실제 object가 없는 final key의 Post 등록 거절 검증
+- 만료된 `ISSUED` session의 삭제 Outbox와 `DELETE_FAILED` 재처리 검증
+- terminal session 보존기간 및 정리 배치 검증
+- Poll이 공유하는 `ImageType.POST` 직접 업로드 흐름 검증
 - 현재 polling 기반 Outbox 처리 지연 측정
 - 측정 결과에 따른 Outbox 발행 지연 개선 여부 결정
 - 직접 업로드 처리 중 서버 종료로 `UPLOAD_OBJECT`가 `PROCESSING`에 남는 경우의 안전한 복구 정책 검토
@@ -306,6 +324,9 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 | Copy/Register timeout 복구 | 완료 | 오래된 `PROCESSING`을 retry/DLQ로 전환 |
 | Post UUID final key 직접 업로드 | 완료 | Copy 제거, Post/Image 동일 transaction, 기존 object cleanup Outbox |
 | 미등록 UUID object 정리 배치 | 완료 | `image_upload_session` 만료 조회, Outbox 예약, 삭제 결과 추적 |
+| 실제 업로드 완료 확인 | 완료 | Post 등록 시 transaction 밖에서 `HeadObject` 검증 |
+| `DELETE_FAILED` 재처리 | 완료 | 기본 1시간 후 새 cleanup operation과 Outbox 생성 |
+| terminal session 정리 | 완료 | `DELETED` 30일, `REGISTERED` 90일 후 삭제 |
 
 ## 구조 개선 커밋 기준
 

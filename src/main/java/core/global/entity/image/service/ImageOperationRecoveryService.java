@@ -159,9 +159,14 @@ public class ImageOperationRecoveryService {
         }
 
         Set<String> alreadyTracked = new HashSet<>(
-                stepRepository.findByStepTypeAndTargetKeyIn(
+                stepRepository.findByStepTypeAndTargetKeyInAndStatusIn(
                                 ImageOperationStepType.DELETE_OBJECT,
-                                cleanupKeys
+                                cleanupKeys,
+                                List.of(
+                                        ImageOperationStepStatus.PENDING,
+                                        ImageOperationStepStatus.PROCESSING,
+                                        ImageOperationStepStatus.RETRY_WAITING
+                                )
                         ).stream()
                         .map(ImageOperationStep::getTargetKey)
                         .toList()

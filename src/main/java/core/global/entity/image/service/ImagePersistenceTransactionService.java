@@ -15,6 +15,7 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
 
 import java.util.HashSet;
 import java.util.List;
@@ -40,6 +41,15 @@ public class ImagePersistenceTransactionService {
     @Transactional(readOnly = true)
     public boolean postImagesExist(Long relatedId) {
         return imageRepository.existsByImageTypeAndRelatedId(ImageType.POST, relatedId);
+    }
+
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public void validateFinalPostImages(List<String> keyOrUrls) {
+        keyOrUrls.stream()
+                .filter(value -> value != null && !value.isBlank())
+                .map(this::finalPostKey)
+                .distinct()
+                .forEach(storageClient::headObject);
     }
 
     @Transactional

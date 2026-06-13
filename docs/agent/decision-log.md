@@ -614,7 +614,7 @@ Post와 Image DB를 같은 transaction에서 반영하면 사용자에게 필요
 ### 결정
 
 - Post용 Presigned URL 발급 시 `image_upload_session`을 `ISSUED`로 저장한다.
-- Post/Image 저장 transaction에서 session row를 잠그고 요청 사용자 소유권을 검증한 뒤 `REGISTERED`로 전환한다.
+- Post/Image 저장 transaction에서 `ISSUED` session row를 잠그고 요청 사용자 소유권을 검증한 뒤 `REGISTERED`로 전환한다.
 - 만료 배치는 `(status, expires_at)` index로 만료된 `ISSUED` session만 조회한다.
 - 이미 `Image.url`에서 사용 중인 session은 `REGISTERED`, 미사용 session은 `DELETE_PENDING`으로 전환한다.
 - Poll 저장 transaction도 존재하는 session을 잠그고 `REGISTERED`로 전환한다. session이 없는 기존 staging Copy 결과는 호환을 위해 허용한다.
@@ -634,8 +634,67 @@ UUID final key 직접 업로드에서는 Post 등록 이전에 object가 생성�
 
 ### 변경 시 주의
 
-- 현재 서버는 실제 PUT 완료 callback을 받지 않으므로 `UPLOADED` 상태를 정확하게 구분하지 않고 `ISSUED`로 유지한다.
+- 실제 object 존재 여부는 Post 등록 요청 처리 중 `HeadObject`로 확인한다.
 - `retention`은 실제 클라이언트가 업로드 후 Post를 제출할 수 있는 최대 허용 시간보다 길게 설정해야 한다.
 - `ImageType.POST`는 Poll도 공유하므로 만료 처리 시 `Image.url` 사용 여부를 함께 확인해야 한다.
 - 향후 다중 서버에서 만료 배치를 병렬 실행하면 `FOR UPDATE SKIP LOCKED` 적용을 검토해야 한다.
-- terminal session 상태의 보관 기간과 이력 정리 배치는 별도로 결정해야 한다.
+- terminal session은 상태별 보존기간 이후 정리하며 `DELETE_FAILED`는 자동 삭제하지 않는다.
+
+## 26. 신규 UUID final key는 Post 등록 시 실제 object를 확인한다
+
+### 결정
+
+- Presigned URL 발급 시 session은 `ISSUED`로 시작한다.
+- 별도 완료 API를 만들지 않는다.
+- Post 등록 요청에서 final key별 `HeadObject`를 실행한다.
+- `HeadObject`는 `Propagation.NOT_SUPPORTED`로 상위 Post transaction을 잠시 중단한 상태에서 실행한다.
+- 검증 성공 후 Post transaction을 재개하고 `ISSUED` session을 claim한다.
+
+### 이유
+
+클라이언트는 NCP PUT 결과를 이미 알 수 있고, 성공 후 바로 Post 등록을 요청한다. 별도 완료 API는 같은 성공 사실을 다시 전달하는 중복 호출이다. Post 등록 요청에서 실제 object를 확인하면 추가 API 없이 존재하지 않는 object key의 Image DB 등록을 막을 수 있다.
+
+### 채택하지 않은 대안
+
+- 별도 업로드 완료 API와 `UPLOADED` 상태
+- `ISSUED` 상태와 클라이언트 응답만 신뢰하고 실제 object 확인 생략
+- NCP Object Storage 전체 목록을 주기적으로 조회해 업로드 여부 확인
+
+현재 운영 중인 서비스가 아니므로 기존 Presigned URL 호환을 위한 단계적 배포 설정은 필요하지 않다.
+
+### 변경 시 주의
+
+- 이미지마다 `HeadObject` 1회가 추가되므로 Post 등록 응답시간에 영향을 준다.
+- `HeadObject`를 DB transaction 안에서 실행하면 connection 장기 점유가 발생하므로 transaction 중단 경계를 유지해야 한다.
+- `HeadObject` 성공 후 실제 DB 저장 전 object가 삭제되는 극히 짧은 경쟁 가능성은 Object Storage와 DB를 단일 transaction으로 묶을 수 없어 남는다.
+
+## 27. 실패한 미등록 object 삭제는 새 cleanup operation으로 재처리한다
+
+### 결정
+
+`DELETE_FAILED` session은 기본 1시간 대기 후 `DELETE_PENDING`으로 전환하고 새 `DELETE_OBJECT + Outbox`를 생성한다. 이전 `DLQ` step은 이력으로 유지한다.
+
+### 이유
+
+DLQ step을 직접 되돌리면 기존 시도 횟수와 실패 이력이 섞인다. 새 operation을 생성하면 재처리 단위와 과거 실패 이력을 분리할 수 있다.
+
+### 변경 시 주의
+
+- 활성 상태인 동일 key 삭제 step이 있으면 새 step을 만들지 않는다.
+- 실제 삭제 직전 `Image.url` 등록 여부를 다시 확인해야 한다.
+
+## 28. terminal upload session은 상태별 보존기간 후 삭제한다
+
+### 결정
+
+- `DELETED`: 기본 30일 보존
+- `REGISTERED`: 기본 90일 보존
+- `DELETE_FAILED`: 자동 삭제하지 않음
+
+### 이유
+
+정상 종료 session을 영구 보존하면 table과 index가 계속 증가한다. 반면 `DELETE_FAILED`는 복구 대상이므로 삭제하면 안 된다.
+
+### 변경 시 주의
+
+terminal session 삭제 배치는 RabbitMQ와 무관하게 실행되어야 한다. 보존기간 변경은 장애 조사에 필요한 이력 기간과 DB 용량을 함께 고려한다.

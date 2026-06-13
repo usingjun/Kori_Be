@@ -105,8 +105,8 @@ class ImageUploadSessionServiceTest {
     void scheduleExpiredSessions_registersUsedObjectsAndSchedulesUnusedObjects() {
         ImageUploadSession used = issued("posts/objects/used.jpg", 10L);
         ImageUploadSession unused = issued("posts/objects/unused.jpg", 10L);
-        when(sessionRepository.findTop200ByStatusAndExpiresAtBeforeOrderByExpiresAtAsc(
-                eq(ImageUploadSessionStatus.ISSUED),
+        when(sessionRepository.findTop200ByStatusInAndExpiresAtBeforeOrderByExpiresAtAsc(
+                eq(List.of(ImageUploadSessionStatus.ISSUED)),
                 any(LocalDateTime.class)
         )).thenReturn(List.of(used, unused));
         when(storageClient.generatePublicUrl(anyString()))
@@ -138,6 +138,45 @@ class ImageUploadSessionServiceTest {
         assertThat(session.getStatus()).isEqualTo(ImageUploadSessionStatus.DELETED);
     }
 
+    @Test
+    void retryFailedDeletes_reschedulesOldFailedSessions() {
+        ReflectionTestUtils.setField(service, "deleteFailedRetryDelay", Duration.ofHours(1));
+        ImageUploadSession session = issued("posts/objects/a.jpg", 10L);
+        session.markDeletePending();
+        session.markDeleteFailed();
+        when(sessionRepository.findTop100ByStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+                eq(ImageUploadSessionStatus.DELETE_FAILED),
+                any(LocalDateTime.class)
+        )).thenReturn(List.of(session));
+        when(recoveryService.scheduleUnregisteredPostObjectDeletes(List.of("posts/objects/a.jpg")))
+                .thenReturn(1);
+
+        int scheduled = service.retryFailedDeletes();
+
+        assertThat(scheduled).isEqualTo(1);
+        assertThat(session.getStatus()).isEqualTo(ImageUploadSessionStatus.DELETE_PENDING);
+    }
+
+    @Test
+    void purgeTerminalSessions_removesOnlyExpiredRegisteredAndDeletedSessions() {
+        ReflectionTestUtils.setField(service, "registeredRetention", Duration.ofDays(90));
+        ReflectionTestUtils.setField(service, "deletedRetention", Duration.ofDays(30));
+        when(sessionRepository.deleteTerminalSessions(
+                eq(ImageUploadSessionStatus.DELETED),
+                any(LocalDateTime.class)
+        )).thenReturn(2);
+        when(sessionRepository.deleteTerminalSessions(
+                eq(ImageUploadSessionStatus.REGISTERED),
+                any(LocalDateTime.class)
+        )).thenReturn(3);
+
+        assertThat(service.purgeTerminalSessions()).isEqualTo(5L);
+        verify(sessionRepository, never()).deleteTerminalSessions(
+                eq(ImageUploadSessionStatus.DELETE_FAILED),
+                any(LocalDateTime.class)
+        );
+    }
+
     private ImageUploadSession issued(String objectKey, Long ownerId) {
         return ImageUploadSession.issue(
                 objectKey,
@@ -146,4 +185,5 @@ class ImageUploadSessionServiceTest {
                 LocalDateTime.now().plusHours(24)
         );
     }
+
 }

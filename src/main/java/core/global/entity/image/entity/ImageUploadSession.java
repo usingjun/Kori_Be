@@ -14,10 +14,10 @@ import java.util.UUID;
 @Entity
 @Table(
         name = "image_upload_session",
-        indexes = @Index(
-                name = "idx_image_upload_session_expiry",
-                columnList = "status, expires_at"
-        )
+        indexes = {
+                @Index(name = "idx_image_upload_session_expiry", columnList = "status, expires_at"),
+                @Index(name = "idx_image_upload_session_status_updated", columnList = "status, updated_at")
+        }
 )
 @Getter
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
@@ -102,6 +102,18 @@ public class ImageUploadSession {
         updatedAt = now;
     }
 
+    public void markRegisteredFromObservedUsage() {
+        if (status == ImageUploadSessionStatus.REGISTERED) return;
+        if (status != ImageUploadSessionStatus.ISSUED
+                && status != ImageUploadSessionStatus.CLAIMED) {
+            throw new IllegalStateException("Image upload session cannot be reconciled from status " + status);
+        }
+        LocalDateTime now = LocalDateTime.now();
+        status = ImageUploadSessionStatus.REGISTERED;
+        registeredAt = now;
+        updatedAt = now;
+    }
+
     public void restoreRegisteredAfterDeleteSkipped() {
         if (status != ImageUploadSessionStatus.DELETE_PENDING) {
             return;
@@ -113,8 +125,9 @@ public class ImageUploadSession {
     }
 
     public void markDeletePending() {
-        if (status != ImageUploadSessionStatus.ISSUED) {
-            throw new IllegalStateException("Image upload session must be ISSUED before delete pending");
+        if (status != ImageUploadSessionStatus.ISSUED
+                && status != ImageUploadSessionStatus.DELETE_FAILED) {
+            throw new IllegalStateException("Image upload session cannot be delete pending from status " + status);
         }
         status = ImageUploadSessionStatus.DELETE_PENDING;
         updatedAt = LocalDateTime.now();

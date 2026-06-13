@@ -189,6 +189,23 @@ staging Copy
 
 UUID final key 직접 업로드, Post/Image 동일 transaction, 미등록 UUID object 정리 배치를 구현했다. 다음 작업의 첫 대상은 실제 NCP 환경 검증이다.
 
+추가로 Post 등록 시 직접 업로드 확인과 session 유지보수를 구현했다.
+
+```text
+Presigned URL 발급
+→ ISSUED
+→ NCP PUT
+→ Post 등록 요청
+→ 상위 transaction을 잠시 중단하고 HeadObject 확인
+→ Post/Image transaction에서 ISSUED → CLAIMED → REGISTERED
+```
+
+- 실제 object가 없는 신규 UUID final key는 Post 등록이 거절된다.
+- `DELETE_FAILED`는 기본 1시간 후 새 cleanup operation으로 재처리한다.
+- `DELETED`는 기본 30일, `REGISTERED`는 기본 90일 후 session row를 삭제한다.
+- 현재 운영 중이 아니므로 session 없는 기존 Presigned URL의 임시 허용 기능은 구현하지 않았다.
+- 최신 전체 검증은 229개 중 18개 실패, 4개 skip이며, 18개 실패는 모두 기존 `pgroonga` extension 생성 권한 문제다.
+
 ## 수정하면 안 되는 부분
 
 - 기존 API response format
@@ -265,13 +282,13 @@ UUID final key 직접 업로드, Post/Image 동일 transaction, 미등록 UUID o
 - Post/Image 등록 transaction은 session row lock, 소유권 검증, `REGISTERED` 전환을 함께 수행한다.
 - 만료 배치는 Object Storage를 순회하지 않고 만료된 `ISSUED` session 최대 200건을 조회한다.
 - 미사용 session은 `DELETE_PENDING + Outbox`, 삭제 성공은 `DELETED`, DLQ 전환은 `DELETE_FAILED`로 추적한다.
-- `REGISTERED`, `DELETED`, `DELETE_FAILED` session 이력의 장기 보관·삭제 정책은 아직 결정되지 않았다.
+- `DELETED`는 기본 30일, `REGISTERED`는 기본 90일 후 삭제하며 `DELETE_FAILED`는 자동 삭제하지 않는다.
 - 정리 scheduler는 `image.cleanup.rabbit.enabled=true`와 `image.unregistered-post-object-cleanup.enabled=true`가 모두 설정된 경우에만 실행된다.
 - Poll은 아직 기존 직접 비동기 처리 경로다.
 
 ## 다음 Task 우선순위
 
-1. 현재 미커밋 UUID final key 직접 업로드 변경사항을 검토하고 커밋한다.
-2. 실제 NCP 환경에서 final key 업로드와 Post/Image 동일 transaction을 검증한다.
-3. `image_upload_session`의 발급, 등록, 만료 Outbox, 삭제 결과 상태 전이를 실제 환경에서 확인한다.
+1. 현재 미커밋 Post 등록 시 `HeadObject` 검증, `DELETE_FAILED` 재처리, terminal session 정리 변경을 검토하고 커밋한다.
+2. 실제 NCP 환경에서 `HeadObject → ISSUED → CLAIMED → REGISTERED` 흐름을 검증한다.
+3. 만료 Outbox, 삭제 실패 재처리, terminal session 삭제를 실제 환경에서 확인한다.
 4. 기존 `temp/` key fallback 제거 시점을 결정한다.

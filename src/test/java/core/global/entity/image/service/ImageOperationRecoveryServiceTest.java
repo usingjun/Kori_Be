@@ -178,9 +178,14 @@ class ImageOperationRecoveryServiceTest {
                 "posts/objects/tracked.jpg",
                 5
         );
-        when(stepRepository.findByStepTypeAndTargetKeyIn(
+        when(stepRepository.findByStepTypeAndTargetKeyInAndStatusIn(
                 ImageOperationStepType.DELETE_OBJECT,
-                List.of("posts/objects/tracked.jpg", "posts/objects/new.jpg")
+                List.of("posts/objects/tracked.jpg", "posts/objects/new.jpg"),
+                List.of(
+                        ImageOperationStepStatus.PENDING,
+                        ImageOperationStepStatus.PROCESSING,
+                        ImageOperationStepStatus.RETRY_WAITING
+                )
         )).thenReturn(List.of(tracked));
         when(operationRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
         when(stepRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));

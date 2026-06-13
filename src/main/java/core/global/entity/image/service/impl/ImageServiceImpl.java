@@ -45,6 +45,7 @@ public class ImageServiceImpl implements ImageService {
     public void savePostImages(Long postId, List<String> toAdd) {
         List<String> adds = copyNullableList(toAdd);
         if (usesFinalPostKeys(adds)) {
+            imagePersistenceTransactionService.validateFinalPostImages(adds);
             imagePersistenceTransactionService.saveFinalPostImages(postId, adds);
             return;
         }
@@ -60,6 +61,7 @@ public class ImageServiceImpl implements ImageService {
         List<String> adds = copyNullableList(toAdd);
         List<String> removes = copyNullableList(toRemove);
         if (usesFinalPostKeys(adds)) {
+            imagePersistenceTransactionService.validateFinalPostImages(adds);
             imagePersistenceTransactionService.updateFinalPostImages(postId, adds, removes);
             return;
         }

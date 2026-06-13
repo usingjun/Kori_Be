@@ -5,6 +5,7 @@ import core.global.enums.common.ImageUploadSessionStatus;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -29,8 +30,25 @@ public interface ImageUploadSessionRepository extends JpaRepository<ImageUploadS
     List<ImageUploadSession> findByObjectKeyInForUpdate(@Param("objectKeys") Collection<String> objectKeys);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    List<ImageUploadSession> findTop200ByStatusAndExpiresAtBeforeOrderByExpiresAtAsc(
-            ImageUploadSessionStatus status,
+    List<ImageUploadSession> findTop200ByStatusInAndExpiresAtBeforeOrderByExpiresAtAsc(
+            Collection<ImageUploadSessionStatus> statuses,
             LocalDateTime expiresAt
+    );
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    List<ImageUploadSession> findTop100ByStatusAndUpdatedAtBeforeOrderByUpdatedAtAsc(
+            ImageUploadSessionStatus status,
+            LocalDateTime updatedAt
+    );
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+            delete from ImageUploadSession s
+            where s.status = :status
+              and s.updatedAt < :updatedAt
+            """)
+    int deleteTerminalSessions(
+            @Param("status") ImageUploadSessionStatus status,
+            @Param("updatedAt") LocalDateTime updatedAt
     );
 }
