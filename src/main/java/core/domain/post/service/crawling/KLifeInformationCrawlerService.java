@@ -3,158 +3,119 @@ package core.domain.post.service.crawling;
 import core.domain.post.entity.CrawledData;
 import core.domain.post.repository.CrawledDataRepository;
 import core.global.service.TranslationService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
-public class KLifeInformationCrawlerService {
-
-    private final CrawledDataRepository crawledDataRepository;
-    private final TranslationService translationService;
+public class KLifeInformationCrawlerService extends AbstractCrawler<Element> {
 
     private static final String BASE_URL = "https://k-life.co";
     private static final String LIST_URL = BASE_URL + "/information";
     private static final String SOURCE_SITE = "k-life.co";
+    private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
     private static final String ARTICLE_SELECTOR = "li.article-section";
     private static final String LINK_SELECTOR = "a.uk-link-reset:has(p.uk-text-break)";
     private static final String TITLE_SELECTOR = "h3.uk-card-title strong";
     private static final String SNIPPET_SELECTOR = "p.uk-text-break";
     private static final String THUMBNAIL_SELECTOR = "img[uk-cover]";
-
     private static final String DETAIL_CONTENT_SELECTOR = "div.rhymix_content.xe_content";
     private static final String DETAIL_IMAGE_SELECTOR = "div.rhymix_content.xe_content img";
 
+    private final TranslationService translationService;
+
+    public KLifeInformationCrawlerService(
+            CrawledDataRepository crawledDataRepository,
+            CrawledDataWriter crawledDataWriter,
+            TranslationService translationService
+    ) {
+        super(crawledDataRepository, crawledDataWriter);
+        this.translationService = translationService;
+    }
+
     @Scheduled(cron = "0 35 5 * * *")
     public void crawlKLifeInformation() {
-        log.info("Starting k-life.co /information crawling...");
-        try {
-            Document listDoc = Jsoup.connect(LIST_URL)
-                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
-                    .timeout(10000).get();
+        crawl();
+    }
 
-            Elements articles = listDoc.select(ARTICLE_SELECTOR);
-            log.info("Found {} articles on k-life /information page.", articles.size());
+    @Override
+    protected String sourceSite() {
+        return SOURCE_SITE;
+    }
 
-            for (Element articleElement : articles) {
+    @Override
+    protected List<Element> fetchArticleReferences() throws Exception {
+        Document listDoc = Jsoup.connect(LIST_URL).userAgent(USER_AGENT).timeout(10000).get();
+        Elements articles = listDoc.select(ARTICLE_SELECTOR);
+        log.info("Found {} articles on k-life /information page.", articles.size());
+        return new ArrayList<>(articles);
+    }
 
-                Element linkElement = articleElement.selectFirst(LINK_SELECTOR);
-                Element titleElement = articleElement.selectFirst(TITLE_SELECTOR);
+    @Override
+    protected String originalUrl(Element articleElement) {
+        Element linkElement = articleElement.selectFirst(LINK_SELECTOR);
+        return linkElement == null ? null : BASE_URL + linkElement.attr("href");
+    }
 
-                if (linkElement == null || titleElement == null) {
-                    log.warn("Skipping article, link or title not found.");
-                    continue;
-                }
+    @Override
+    protected Optional<CrawledData> parseArticle(Element articleElement) throws Exception {
+        Element linkElement = articleElement.selectFirst(LINK_SELECTOR);
+        Element titleElement = articleElement.selectFirst(TITLE_SELECTOR);
+        if (linkElement == null || titleElement == null) {
+            log.warn("Skipping article, link or title not found.");
+            return Optional.empty();
+        }
 
-                Element snippetElement = linkElement.selectFirst(SNIPPET_SELECTOR);
-                Element thumbElement = linkElement.selectFirst(THUMBNAIL_SELECTOR);
+        Element snippetElement = linkElement.selectFirst(SNIPPET_SELECTOR);
+        Element thumbElement = linkElement.selectFirst(THUMBNAIL_SELECTOR);
+        String originalUrl = originalUrl(articleElement);
+        String titleKorean = titleElement.text();
+        String descriptionKorean = snippetElement != null ? snippetElement.text() : "";
+        Set<String> imageUrlSet = new HashSet<>();
 
-                String relativeUrl = linkElement.attr("href");
-                String originalUrl = BASE_URL + relativeUrl;
-                String titleKOR = titleElement.text();
-                String descriptionKOR = (snippetElement != null) ? snippetElement.text() : "";
-
-                if (crawledDataRepository.existsByOriginalUrl(originalUrl)) {
-                    log.debug("Skipping already crawled article: {}", originalUrl);
-                    continue;
-                }
-
-                String fullContentKOR = "";
-                Set<String> imageUrlSet = new HashSet<>();
-
-                if (thumbElement != null) {
-                    String thumbUrl = thumbElement.absUrl("src");
-                    if (thumbUrl != null && !thumbUrl.contains("no-image.png")) {
-                        imageUrlSet.add(getHighQualityUrl(thumbUrl));
-                    }
-                }
-
-                try {
-                    log.info("Crawling detail page: {}", originalUrl);
-                    Document detailDoc = Jsoup.connect(originalUrl)
-                            .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
-                            .timeout(10000).get();
-
-                    Element contentElement = detailDoc.selectFirst(DETAIL_CONTENT_SELECTOR);
-
-                    if (contentElement != null) {
-                        fullContentKOR = contentElement.text();
-                        Elements contentImages = contentElement.select(DETAIL_IMAGE_SELECTOR);
-
-                        contentImages.forEach(img -> {
-                            String imgUrl = img.absUrl("src");
-                            if (imgUrl != null && !imgUrl.isEmpty()) {
-                                imageUrlSet.add(getHighQualityUrl(imgUrl));
-                            }
-                        });
-                    } else {
-                        fullContentKOR = descriptionKOR;
-                    }
-
-                } catch (IOException e) {
-                    log.error("Failed to crawl detail page: {}. Skipping.", originalUrl, e);
-                    continue;
-                }
-
-                String translatedTitle = translationService.translatePost(titleKOR, "en");
-                String translatedContent = translationService.translatePost(fullContentKOR, "en");
-
-                List<String> imageUrls = new ArrayList<>(imageUrlSet);
-
-                CrawledData crawledData = new CrawledData(
-                        translatedTitle,
-                        translatedContent,
-                        originalUrl,
-                        SOURCE_SITE,
-                        imageUrls
-                );
-
-                saveCrawledData(crawledData);
-
-                Thread.sleep(3000);
-
-            }
-
-        } catch (IOException | InterruptedException e) {
-            log.error("Error occurred during crawling k-life.co /information", e);
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
+        if (thumbElement != null) {
+            String thumbUrl = thumbElement.absUrl("src");
+            if (!thumbUrl.contains("no-image.png")) {
+                imageUrlSet.add(getHighQualityUrl(thumbUrl));
             }
         }
-        log.info("Finished k-life.co /information crawling.");
+
+        log.info("Crawling detail page: {}", originalUrl);
+        Document detailDoc = Jsoup.connect(originalUrl).userAgent(USER_AGENT).timeout(10000).get();
+        Element contentElement = detailDoc.selectFirst(DETAIL_CONTENT_SELECTOR);
+        String fullContentKorean = contentElement != null ? contentElement.text() : descriptionKorean;
+
+        if (contentElement != null) {
+            contentElement.select(DETAIL_IMAGE_SELECTOR).forEach(image -> {
+                String imageUrl = image.absUrl("src");
+                if (!imageUrl.isEmpty()) {
+                    imageUrlSet.add(getHighQualityUrl(imageUrl));
+                }
+            });
+        }
+
+        return Optional.of(new CrawledData(
+                translationService.translatePost(titleKorean, "en"),
+                translationService.translatePost(fullContentKorean, "en"),
+                originalUrl,
+                SOURCE_SITE,
+                new ArrayList<>(imageUrlSet)
+        ));
     }
 
     private String getHighQualityUrl(String url) {
-        if (url == null) return "";
-        if (url.contains("?")) {
-            return url.substring(0, url.indexOf("?"));
-        }
-        return url;
-    }
-
-    @Transactional
-    public void saveCrawledData(CrawledData data) {
-        try {
-            crawledDataRepository.save(data);
-            log.info("Successfully crawled and saved: {}", data.getOriginalUrl());
-        } catch (DataIntegrityViolationException e) {
-            log.warn("Duplicate entry found. Skipping.");
-        }
+        return url.contains("?") ? url.substring(0, url.indexOf("?")) : url;
     }
 }
