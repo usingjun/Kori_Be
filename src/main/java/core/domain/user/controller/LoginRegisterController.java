@@ -3,6 +3,7 @@ package core.domain.user.controller;
 import core.domain.admin.service.AdminAuthService;
 import core.domain.user.dto.*;
 import core.domain.user.service.UserService;
+import core.domain.user.service.UserWithdrawalService;
 import core.global.apple.dto.AppleLoginByCodeRequest;
 import core.global.apple.dto.WithdrawIsApple;
 import core.global.apple.service.AppleAuthService;
@@ -56,6 +57,7 @@ import java.util.Locale;
 @Slf4j
 public class LoginRegisterController {
     private final UserService userService;
+    private final UserWithdrawalService userWithdrawalService;
     private final PasswordService passwordService;
     private final AppleAuthService appleAuthService;
     private final ApplicationEventPublisher publisher;
@@ -251,7 +253,7 @@ public class LoginRegisterController {
     @UserErrorDocs({UserErrorCode.USER_NOT_FOUND})
     public ResponseEntity<WithdrawIsApple> withdraw(HttpServletRequest request , @AuthenticationPrincipal CustomUserDetails principal) {
         String accessToken = jwtTokenProvider.resolveToken(request);
-        boolean isapple = userService.withdrawUser(principal.getUserId(), accessToken);
+        boolean isapple = userWithdrawalService.withdraw(principal.getUserId(), accessToken);
         WithdrawIsApple withdrawIsApple = new WithdrawIsApple(isapple);
         return ResponseEntity.ok(withdrawIsApple);
     }
