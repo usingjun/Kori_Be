@@ -1,16 +1,14 @@
 package core.domain.payment.service;
 
-import core.domain.payment.config.AppleClient;
-import core.domain.payment.config.GoogleClient;
-import core.domain.payment.dto.AppleTransactionInfo;
 import core.domain.payment.dto.EntitlementResponse;
-import core.domain.payment.dto.GooglePurchase;
+import core.domain.payment.dto.VerifiedStorePurchase;
 import core.domain.payment.dto.VerifyRequest;
 import core.domain.payment.entity.*;
 import core.domain.payment.repository.*;
+import core.domain.payment.service.strategy.StorePurchaseVerificationStrategy;
+import core.domain.payment.service.strategy.StorePurchaseVerificationStrategyResolver;
 import core.domain.user.entity.User;
 import core.domain.user.repository.UserRepository;
-import core.global.enums.DeviceType;
 import core.global.enums.errorcode.UserErrorCode;
 import core.global.enums.payment.EntitlementStatus;
 import core.global.enums.payment.PaymentProductType;
@@ -25,34 +23,30 @@ import org.springframework.stereotype.Service;
 @RequiredArgsConstructor
 public class IapService {
 
-    private final GoogleClient googleClient;
-    private final AppleClient appleClient;
+    private final StorePurchaseVerificationStrategyResolver strategyResolver;
     private final IapPurchaseRepository purchaseRepository;
     private final IapEntitlementRepository entitlementRepository;
-    private final IapProductRepository productRepository;
     private final UserItemRepository userItemRepository;
     private final IapBonusGrantRepository bonusGrantRepository;
     private final UserRepository userRepository;
 
     @Transactional
     public EntitlementResponse verify(VerifyRequest req) {
-        // 외부 API 호출 (비트랜잭션 영역)
-        if ("ios".equalsIgnoreCase(req.platform())) {
-            if (req.transactionId() == null || req.transactionId().isBlank()) {
-                throw new IllegalArgumentException("iOS: transactionId is required");
-            }
+        StorePurchaseVerificationStrategy strategy = strategyResolver.resolve(req.platform());
+        VerifiedStorePurchase verifiedPurchase = strategy.verify(req);
 
-            AppleTransactionInfo tx = appleClient.getTransaction(req.transactionId());
-            return verifyIosTx(req, tx);
-        } else if ("android".equalsIgnoreCase(req.platform())) {
-            if (req.purchaseToken() == null || req.purchaseToken().isBlank()) {
-                throw new IllegalArgumentException("Android: purchaseToken is required");
-            }
+        String email = SecurityContextHolder.getContext().getAuthentication().getName();
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new BusinessException(UserErrorCode.USER_NOT_FOUND));
 
-            GooglePurchase gp = googleClient.verify(req.productId(), req.purchaseToken());
-            return verifyAndroidTx(req, gp);
-        }
-        throw new IllegalArgumentException("Unsupported platform: " + req.platform());
+        IapPurchase purchase = strategy.findOrCreatePurchase(verifiedPurchase, user.getId());
+        purchaseRepository.save(purchase);
+        applyPostPurchaseSideEffects(purchase);
+
+        IapEntitlement entitlement = IapEntitlement.fromPurchase(purchase);
+        entitlementRepository.save(entitlement);
+
+        return EntitlementResponse.fromEntity(entitlement);
     }
 
     public EntitlementResponse getEntitlements() {
@@ -64,60 +58,6 @@ public class IapService {
                 .orElseGet(() -> new IapEntitlement(user.getId(), false, EntitlementStatus.EXPIRED));
         return EntitlementResponse.fromEntity(e);
     }
-
-    public EntitlementResponse verifyIosTx(VerifyRequest req, AppleTransactionInfo tx) {
-        String email = SecurityContextHolder.getContext().getAuthentication().getName();
-        User user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new BusinessException(UserErrorCode.USER_NOT_FOUND));
-
-        // product 매핑: 애플 productId 기준
-        IapProduct product = productRepository
-                .findByPlatformAndStoreProductId(DeviceType.IOS, tx.productId())
-                .orElse(null);
-
-        // 멱등 업서트(ios, transactionId)
-        IapPurchase purchase = purchaseRepository
-                .findByPlatformAndStoreTxId(DeviceType.IOS, tx.transactionId())
-                .orElseGet(() -> new IapPurchase(user.getId(), DeviceType.IOS, product, tx));
-
-        purchaseRepository.save(purchase);
-        applyPostPurchaseSideEffects(purchase);
-
-        IapEntitlement ent = IapEntitlement.fromPurchase(purchase);
-        entitlementRepository.save(ent);
-
-        return new EntitlementResponse(user.getId(), ent.isActive(), ent.getFeature(), ent.getTier(),
-                ent.getExpiresAt(), ent.getSource().name(), ent.getStatus().name());
-    }
-
-
-    public EntitlementResponse verifyAndroidTx(VerifyRequest req, GooglePurchase gp) {
-        String email = SecurityContextHolder.getContext().getAuthentication().getName();
-        User user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new BusinessException(UserErrorCode.USER_NOT_FOUND));
-
-        // product 매핑: 안드로이드 productId(구독은 lineItem.productId, 일회성은 요청 productId)
-        String storeProductId = (gp.productId() != null) ? gp.productId() : req.productId();
-
-        IapProduct product = productRepository
-                .findByPlatformAndStoreProductId(DeviceType.ANDROID, storeProductId)
-                .orElseThrow(() -> new BusinessException(UserErrorCode.INVALID_FOLLOW_STATUS)); //TODO
-
-        // 멱등 업서트(android, purchaseToken)
-        IapPurchase purchase = purchaseRepository
-                .findByPlatformAndStoreTxId(DeviceType.ANDROID, req.purchaseToken())
-                .orElseGet(() -> new IapPurchase(user.getId(), DeviceType.ANDROID, product, gp));
-
-        purchaseRepository.save(purchase);
-        applyPostPurchaseSideEffects(purchase);
-
-        IapEntitlement ent = IapEntitlement.fromPurchase(purchase);
-        entitlementRepository.save(ent);
-
-        return new EntitlementResponse(user.getId(), ent.isActive(), ent.getFeature(), ent.getTier(),
-                ent.getExpiresAt(), ent.getSource().name(), ent.getStatus().name());
-    }
-
 
     private void applyPostPurchaseSideEffects(IapPurchase purchase) {
         applyConsumableCreditIfBoostPurchase(purchase);

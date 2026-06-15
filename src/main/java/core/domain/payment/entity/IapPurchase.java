@@ -1,7 +1,6 @@
 package core.domain.payment.entity;
 
-import core.domain.payment.dto.AppleTransactionInfo;
-import core.domain.payment.dto.GooglePurchase;
+import core.domain.payment.dto.VerifiedStorePurchase;
 import core.global.enums.DeviceType;
 import core.global.enums.payment.PurchaseStatus;
 import jakarta.persistence.*;
@@ -61,26 +60,15 @@ public class IapPurchase {
     @Column(name = "raw_json")
     private String rawJson;
 
-    public IapPurchase( Long userId, DeviceType platform, IapProduct product, AppleTransactionInfo tx) {
+    public IapPurchase(Long userId, IapProduct product, VerifiedStorePurchase purchase) {
         this.userId = userId;
-        this.platform = platform;
+        this.platform = purchase.platform();
         this.product = product;
-        this.storeTxId = tx.transactionId();
-        this.originalTxId = tx.originalTransactionId();
-        this.status = tx.status();
-        this.purchasedAt = tx.purchaseDate();
-        this.expiresAt = tx.expiresDate();
-        this.rawJson = tx.raw();
-    }
-
-    public IapPurchase(Long userId, DeviceType platform, IapProduct product, GooglePurchase gp) {
-        this.userId = userId;
-        this.platform = platform;
-        this.product = product;
-        this.storeTxId = gp.purchaseToken();
-        this.status = gp.status();
-        this.purchasedAt = gp.purchaseTime();
-        this.expiresAt = gp.expiresTime();
-        this.rawJson = gp.raw();
+        this.storeTxId = purchase.storeTransactionId();
+        this.originalTxId = purchase.originalTransactionId();
+        this.status = purchase.status();
+        this.purchasedAt = purchase.purchasedAt();
+        this.expiresAt = purchase.expiresAt();
+        this.rawJson = purchase.rawJson();
     }
 }

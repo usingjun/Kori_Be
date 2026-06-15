@@ -4,34 +4,19 @@ package core.domain.user.service;
 import core.domain.bookmark.repository.BookmarkRepository;
 import core.domain.chat.entity.ChatParticipant;
 import core.domain.chat.entity.ChatRoom;
-import core.domain.chat.repository.ChatMessageRepository;
 import core.domain.chat.repository.ChatParticipantRepository;
-import core.domain.chat.repository.ChatReportRepository;
 import core.domain.chat.repository.ChatRoomRepository;
 import core.domain.comment.repository.CommentRepository;
 import core.domain.notification.dto.NewUserJoinedEvent;
-import core.domain.notification.repository.NotificationRepository;
-import core.domain.payment.repository.IapBonusGrantRepository;
-import core.domain.payment.repository.IapEntitlementRepository;
-import core.domain.payment.repository.IapPurchaseRepository;
-import core.domain.payment.repository.UserItemRepository;
-import core.domain.poll.entity.Poll;
-import core.domain.poll.repository.VoteRecordRepository;
 import core.domain.post.entity.Post;
-import core.domain.post.repository.BlockPostRepository;
-import core.domain.post.repository.PostReportRepository;
 import core.domain.post.repository.PostRepository;
 import core.domain.user.dto.*;
 import core.domain.user.entity.Follow;
 import core.domain.user.entity.User;
-import core.domain.user.repository.AdminOtpRepository;
 import core.domain.user.repository.BlockRepository;
 import core.domain.user.repository.FollowRepository;
 import core.domain.user.repository.UserRepository;
-import core.domain.userdevicetoken.repository.UserDeviceTokenRepository;
-import core.domain.usernotificationsetting.repository.UserNotificationSettingRepository;
 import core.global.apple.dto.AppleLoginByCodeRequest;
-import core.global.apple.service.AppleWithdrawalService;
 import core.global.dto.*;
 import core.global.entity.image.entity.Image;
 import core.global.entity.image.repository.ImageRepository;
@@ -53,7 +38,6 @@ import core.global.pagination.CursorPages;
 import core.global.redis.service.RedisService;
 import core.global.security.JwtTokenProvider;
 import core.global.service.SmtpMailService;
-import core.global.userfeedback.UserFeedbackRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
@@ -100,7 +84,6 @@ public class UserService {
     private static final Pattern PW_RULE = Pattern.compile(
             "^(?=.*[@/!/~])[A-Za-z0-9@/!/~]{8,12}$"
     );
-    private final BlockPostRepository blockPostRepository;
     private final ApplicationEventPublisher eventPublisher;
     private final PasswordEncoder passwordEncoder;
     private final BlockRepository blockRepository;
@@ -112,27 +95,13 @@ public class UserService {
     private final JwtTokenProvider jwtTokenProvider;
     private final CommentRepository commentRepository;
     private final BookmarkRepository bookmarkRepository;
-    private final ChatMessageRepository chatMessageRepository;
     private final ChatParticipantRepository chatParticipantRepository;
     private final PostRepository postRepository;
     private final ImageRepository imageRepository;
     private final FollowRepository followRepository;
     private final LikeRepository likeRepository;
-    private final AppleWithdrawalService appleWithdrawalService;
     private final ChatRoomRepository chatRoomRepository;
     private final ApplicationEventPublisher publisher;
-    private final UserDeviceTokenRepository userDeviceTokenRepository;
-    private final NotificationRepository notificationRepository;
-    private final UserNotificationSettingRepository userNotificationSettingRepository;
-    private final UserFeedbackRepository userFeedbackRepository;
-    private final IapPurchaseRepository iapPurchaseRepository;
-    private final IapEntitlementRepository iapEntitlementRepository;
-    private final IapBonusGrantRepository iapBonusGrantRepository;
-    private final UserItemRepository userItemRepository;
-    private final PostReportRepository postReportRepository;
-    private final ChatReportRepository chatReportRepository;
-    private final VoteRecordRepository voteRecordRepository;
-    private final AdminOtpRepository adminOtpRepository;
 
     Pattern pattern = Pattern.compile("\\[(.*?)\\]");
 
@@ -843,157 +812,6 @@ public class UserService {
         eventPublisher.publishEvent(event);
     }
 
-
-    /**
-     * 회원 탈퇴를 처리하는 메서드.
-     * 사용자와 관련된 모든 데이터를 삭제하고, 토큰을 무효화합니다.
-     *
-     * @param userId      탈퇴할 사용자의 ID
-     * @param accessToken 블랙리스트에 추가할 사용자의 Access Token
-     */
-    /**
-     * 회원 탈퇴 메인 메소드 (Orchestrator)
-     */
-    @Transactional
-    public boolean withdrawUser(Long userId, String accessToken) {
-        User user = userRepository.findById(userId)
-                .orElseThrow(() -> new BusinessException(UserErrorCode.USER_NOT_FOUND));
-        boolean isApple = false;
-
-        if (Oauthplatform.APPLE.toString().equals(user.getProvider())) {
-            appleWithdrawalService.revokeAppleToken(user);
-            isApple = true;
-        }
-
-        cleanupUserData(user); // DB 작업들
-
-        eventPublisher.publishEvent(new UserWithdrawalEvent(userId, accessToken));
-
-        return isApple;
-    }
-
-    /**
-     * 회원 탈퇴 시 연관 데이터를 모두 삭제하는 메서드.
-     * 삭제 순서가 매우 중요합니다 (자식 데이터 -> 부모 데이터).
-     */
-    private void cleanupUserData(User user) {
-        Long userId = user.getId();
-
-        // =========================================================
-        // 1. [Payment] 결제 및 아이템 관련 (가장 독립적인 데이터)
-        // =========================================================
-        // IapPurchase는 다른 테이블에서 참조될 수 있으므로 마지막에 삭제
-        iapEntitlementRepository.deleteAllByUserId(userId); // 구독/권한
-        iapBonusGrantRepository.deleteAllByUserId(userId);  // 보너스
-        userItemRepository.deleteAllByUserId(userId);       // 아이템
-        iapPurchaseRepository.deleteAllByUserId(userId);    // 결제 내역
-
-
-        // =========================================================
-        // 2. [Report] 신고 관련 (User 참조 해제)
-        // =========================================================
-        // 2-1. 내가 신고한 내역
-        postReportRepository.deleteAllByReporterId(userId);
-        chatReportRepository.deleteAllByReporterUserId(userId);
-
-        // 2-2. 내가 신고 당한 내역 (User가 사라지면 신고 대상도 사라짐)
-        postReportRepository.deleteAllByReportedUserId(userId);
-        chatReportRepository.deleteAllByReportedUserId(userId);
-
-
-        // =========================================================
-        // 3. [Vote] 투표 참여 기록 (내가 한 투표)
-        // =========================================================
-        voteRecordRepository.deleteAllByUserId(userId);
-
-
-        // =========================================================
-        // 4. [Chat] 채팅방 및 메시지 정리
-        // =========================================================
-        List<ChatRoom> ownedChatRooms = chatRoomRepository.findAllByOwnerId(userId);
-
-        for (ChatRoom chatRoom : ownedChatRooms) {
-            // 방장 위임 로직: 나를 제외한 다른 참여자 찾기
-            List<ChatParticipant> participants = chatParticipantRepository.findAllByChatRoomIdAndUserIdNot(chatRoom.getId(), userId);
-
-            if (!participants.isEmpty()) {
-                User newOwner = participants.get(0).getUser();
-                chatRoom.changeOwner(newOwner);
-                chatRoomRepository.save(chatRoom);
-            } else {
-                // 남은 사람이 없으면 방 삭제
-                // (Cascade 설정에 따라 메시지/참여자가 자동 삭제되지 않는다면 별도 삭제 필요할 수 있음)
-                chatRoomRepository.delete(chatRoom);
-            }
-        }
-
-        // 채팅 참여 정보 및 내가 보낸 메시지 삭제
-        chatParticipantRepository.deleteAllByUserId(userId);
-        chatMessageRepository.deleteAllBySenderId(userId);
-
-
-        // =========================================================
-        // 5. [Post & Interaction] 게시글 및 커뮤니티 활동 정리
-        // =========================================================
-        blockPostRepository.deleteAllBlockPostsRelatedToUser(userId);
-
-        // 5-1. 내가 작성한 게시글 조회
-        List<Post> userPosts = postRepository.findAllByAuthorId(userId);
-
-        if (userPosts != null && !userPosts.isEmpty()) {
-            // [순서 중요] Post 삭제 전, Post를 참조하는 자식 엔티티 먼저 삭제
-
-            // A. 댓글 및 북마크 삭제
-            commentRepository.deleteAllByPostIn(userPosts);
-            bookmarkRepository.deleteAllByPostIn(userPosts);
-
-            // B. 내 글에 달린 신고 내역 삭제 (안 지우면 FK 에러)
-            postReportRepository.deleteAllByPostIn(userPosts);
-
-            // C. [CRITICAL FIX] 내 글에 포함된 투표(Poll)에 달린 "다른 사람들의 투표 기록" 삭제
-            // 이걸 안 하면 PollOption 삭제 시 fk_vote_option 에러 발생
-            List<Poll> userPolls = userPosts.stream()
-                    .map(Post::getPoll)
-                    .filter(Objects::nonNull) // Poll이 없는 게시글 제외
-                    .toList();
-
-            if (!userPolls.isEmpty()) {
-                voteRecordRepository.deleteAllByPollIn(userPolls);
-            }
-
-            // D. 게시글 삭제 (Cascade로 인해 Poll, PollOption 자동 삭제됨)
-            postRepository.deleteAll(userPosts);
-        }
-
-        // 5-2. 남의 글에 남긴 내 흔적 삭제
-        commentRepository.deleteAllByAuthorId(userId);  // 내가 쓴 댓글
-        bookmarkRepository.deleteAllByUserId(userId);   // 내가 한 북마크
-        likeRepository.deleteAllByUserId(userId);       // 내가 누른 좋아요
-        followRepository.deleteAllByUserId(userId);     // 팔로우 내역 (내가 한 팔로우)
-        // 필요 시: followRepository.deleteAllByFollowerId(userId); // 나를 향한 팔로우
-
-
-        // =========================================================
-        // 6. [Misc] 기타 사용자 정보 정리
-        // =========================================================
-        imageRepository.deleteAllByImageTypeAndRelatedId(ImageType.USER, userId);
-        imageService.deleteUserProfileImage(userId);
-        adminOtpRepository.deleteAllByUserId(userId);
-        blockRepository.deleteAllByUserOrBlocked(user); // 차단 목록
-
-        userNotificationSettingRepository.deleteAllByUserId(userId);
-        userDeviceTokenRepository.deleteAllByUserId(userId);
-
-        notificationRepository.deleteAllByUserId(userId);  // 받은 알림
-        notificationRepository.deleteAllByActorId(userId); // 보낸 알림
-
-        userFeedbackRepository.deleteAllByUserIdExplicit(userId);
-
-        // =========================================================
-        // 7. [Final] 사용자 계정 삭제
-        // =========================================================
-        userRepository.delete(user);
-    }
 
     public UserProfileCardResponse findCardUserProfile(Long userId, Long currentUserId) {
         User user = userRepository.findById(userId)
