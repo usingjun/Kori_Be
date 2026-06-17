@@ -19,6 +19,8 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.security.SecureRandom;
 import java.time.Duration;
@@ -141,22 +143,12 @@ public class AiGroupChatRevivalService {
         if (context == null) return;
 
         // 🧠 [2단계] AI 메시지 생성 (DB 연결 불필요 구간)
-        String revivalMessage = generateDynamicRevivalMessage(context.aiUser, context.persona, context.lastMessages);
-
-        // 💾 [3단계] 메시지 전송 (트랜잭션 O)
-        SendMessageRequest request = new SendMessageRequest(
-                room.getId(),
-                context.aiUser.getId(),
-                revivalMessage,
-                MessageType.TEXT
-        );
-
-        try {
-            chatMessageService.processAndSendChatMessage(request);
-            log.info("🚑 CPR Success: Room[{}] AI[{}] Msg[{}]", room.getId(), context.aiUser.getFirstName(), revivalMessage);
-        } catch (Exception e) {
-            log.error("❌ Revival failed for room {}", room.getId(), e);
-        }
+        generateDynamicRevivalMessage(context.aiUser, context.persona, context.lastMessages)
+                .publishOn(Schedulers.boundedElastic())
+                .subscribe(
+                        revivalMessage -> sendRevivalMessage(room, context.aiUser, revivalMessage),
+                        error -> log.error("Revival generation failed for room {}", room.getId(), error)
+                );
     }
 
     private record RevivalContext(User aiUser, AiPersona persona, List<ChatMessage> lastMessages) {}
@@ -165,7 +157,7 @@ public class AiGroupChatRevivalService {
      * AI 페르소나와 이전 대화를 기반으로 '살아있는' 멘트 생성
      * (24시간 지난 대화는 문맥에서 제외)
      */
-    private String generateDynamicRevivalMessage(User aiUser, AiPersona persona, List<ChatMessage> lastMessages) { // 👈 파라미터 3개로 변경
+    private Mono<String> generateDynamicRevivalMessage(User aiUser, AiPersona persona, List<ChatMessage> lastMessages) {
         try {
             // 🟢 [핵심] 24시간 필터링: 너무 오래된 메시지는 문맥에서 제거
             Instant oneDayAgo = Instant.now().minus(Duration.ofHours(24));
@@ -189,16 +181,37 @@ public class AiGroupChatRevivalService {
                     )
             );
 
-            String response = aiClient.generateResponse(input);
-
-            if (response != null && !response.isBlank()) {
-                return response.replace("\"", "").trim();
-            }
-
+            return aiClient.generateResponse(input)
+                    .filter(response -> !response.isBlank())
+                    .map(response -> response.replace("\"", "").trim())
+                    .defaultIfEmpty(randomFallbackTopic())
+                    .onErrorResume(error -> {
+                        log.warn("LLM Revival Failed (Using Fallback): {}", error.getMessage());
+                        return Mono.just(randomFallbackTopic());
+                    });
         } catch (Exception e) {
-            log.warn("⚠️ LLM Revival Failed (Using Fallback): {}", e.getMessage());
+            log.warn("LLM Revival Failed (Using Fallback): {}", e.getMessage());
+            return Mono.just(randomFallbackTopic());
         }
+    }
 
+    private void sendRevivalMessage(ChatRoom room, User aiUser, String revivalMessage) {
+        SendMessageRequest request = new SendMessageRequest(
+                room.getId(),
+                aiUser.getId(),
+                revivalMessage,
+                MessageType.TEXT
+        );
+
+        try {
+            chatMessageService.processAndSendChatMessage(request);
+            log.info("CPR Success: Room[{}] AI[{}] Msg[{}]", room.getId(), aiUser.getFirstName(), revivalMessage);
+        } catch (Exception e) {
+            log.error("Revival failed for room {}", room.getId(), e);
+        }
+    }
+
+    private String randomFallbackTopic() {
         return FALLBACK_TOPICS[secureRandom.nextInt(FALLBACK_TOPICS.length)];
     }
 

@@ -269,10 +269,15 @@ public class AiChatCoordinatorService {
 
         taskScheduler.schedule(() -> {
             try {
-                aiChatUserService.processAiResponse(aiUser, event, userMessage, isMainSpeaker);
+                aiChatUserService.processAiResponse(aiUser, event, userMessage, isMainSpeaker)
+                        .doFinally(signalType -> thinkingStateManager.finishThinking(roomId, aiUser.getId()))
+                        .subscribe(
+                                ignored -> {
+                                },
+                                error -> log.error("Fast Response Error", error)
+                        );
             } catch (Exception e) {
                 log.error("Fast Response Error", e);
-            } finally {
                 thinkingStateManager.finishThinking(roomId, aiUser.getId());
             }
         }, executionTime);
@@ -297,7 +302,12 @@ public class AiChatCoordinatorService {
                 log.info("✋ AI [{}] Late reply ABORTED. Context changed.", aiUser.getFirstName());
                 return;
             }
-            aiChatUserService.processAiResponse(aiUser, originalEvent, latestMsg.getContent(), false);
+            aiChatUserService.processAiResponse(aiUser, originalEvent, latestMsg.getContent(), false)
+                    .subscribe(
+                            ignored -> {
+                            },
+                            error -> log.error("Late Response Error", error)
+                    );
         } catch (Exception e) {
             log.error("Late Response Error", e);
         }

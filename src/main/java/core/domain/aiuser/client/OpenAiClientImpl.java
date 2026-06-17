@@ -1,88 +1,103 @@
 package core.domain.aiuser.client;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.RestTemplate;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 
 
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class OpenAiClientImpl implements AiClient {
 
-    @Value("${openai.api-key}")
-    private String apiKey;
+    private static final int MAX_ATTEMPTS = 3;
+    private static final Duration INITIAL_BACKOFF = Duration.ofSeconds(1);
+    private static final ParameterizedTypeReference<Map<String, Object>> RESPONSE_TYPE =
+            new ParameterizedTypeReference<>() {
+            };
+    private final WebClient openAiWebClient;
 
-    private final RestTemplate openaiRestTemplate;
-    private static final String API_URL = "https://api.openai.com/v1/responses";
+    public OpenAiClientImpl(@Qualifier("openAiWebClient") WebClient openAiWebClient) {
+        this.openAiWebClient = openAiWebClient;
+    }
 
     @Override
-    public String generateResponse(List<Map<String, Object>> messages) {
-        int maxRetries = 3;
-        long waitTime = 1000;
+    public Mono<String> generateResponse(List<Map<String, Object>> messages) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", "gpt-5.1-codex-mini");
+        body.put("input", messages);
+        body.put("max_output_tokens", 2000);
 
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                HttpHeaders headers = new HttpHeaders();
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                headers.setBearerAuth(apiKey);
+        return openAiWebClient.post()
+                .uri("/responses")
+                .bodyValue(body)
+                .retrieve()
+                .bodyToMono(RESPONSE_TYPE)
+                .map(this::extractOutputText)
+                .retryWhen(Retry.backoff(MAX_ATTEMPTS - 1, INITIAL_BACKOFF)
+                        .maxBackoff(Duration.ofSeconds(2))
+                        .filter(this::isRetryable)
+                        .doBeforeRetry(signal -> log.warn(
+                                "OpenAI API 호출 재시도 ({}/{}): {}",
+                                signal.totalRetries() + 2,
+                                MAX_ATTEMPTS,
+                                signal.failure().getMessage()
+                        )))
+                .doOnError(error -> log.error(
+                        "OpenAI API 최종 호출 실패: {}",
+                        error.getMessage()
+                ))
+                .onErrorResume(error -> Mono.empty());
+    }
 
-                Map<String, Object> body = new HashMap<>();
-                body.put("model", "gpt-5.1-codex-mini");
-                body.put("input", messages);
-                body.put("max_output_tokens", 2000);
+    private String extractOutputText(Map<String, Object> responseBody) {
+        Object rawOutputs = responseBody.get("output");
+        if (!(rawOutputs instanceof List<?> outputs)) {
+            throw new IllegalStateException("Unexpected response structure or empty content");
+        }
 
-                HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
+        for (Object rawOutput : outputs) {
+            if (!(rawOutput instanceof Map<?, ?> output) || !"message".equals(output.get("type"))) {
+                continue;
+            }
 
-                ResponseEntity<Map> response = openaiRestTemplate.postForEntity(API_URL, request, Map.class);
-                Map<String, Object> responseBody = response.getBody();
+            Object rawContents = output.get("content");
+            if (!(rawContents instanceof List<?> contents)) {
+                continue;
+            }
 
-                if (responseBody != null && responseBody.containsKey("output")) {
-                    List<Map<String, Object>> outputs = (List<Map<String, Object>>) responseBody.get("output");
-
-                    for (Map<String, Object> out : outputs) {
-                        if ("message".equals(out.get("type")) && out.containsKey("content")) {
-                            List<Map<String, Object>> contents = (List<Map<String, Object>>) out.get("content");
-
-                            for (Map<String, Object> c : contents) {
-                                if ("output_text".equals(c.get("type"))) {
-                                    return (String) c.get("text");
-                                }
-                            }
-                        }
+            for (Object rawContent : contents) {
+                if (rawContent instanceof Map<?, ?> content && "output_text".equals(content.get("type"))) {
+                    Object text = content.get("text");
+                    if (text instanceof String outputText && !outputText.isBlank()) {
+                        return outputText;
                     }
-                }
-                throw new RuntimeException("Unexpected response structure or empty content");
-
-            } catch (Exception e) {
-                log.warn("⚠️ OpenAI API 호출 실패 (시도 {}/{}): {}", attempt, maxRetries, e.getMessage());
-
-                if (attempt == maxRetries) {
-                    log.error("❌ 최종 API 호출 실패. 더 이상 재시도하지 않습니다.");
-                    return null;
-                }
-
-                try {
-                    Thread.sleep(waitTime);
-                    waitTime *= 2;
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    log.error("API 재시도 대기 중 인터럽트 발생");
-                    return null;
                 }
             }
         }
 
-        return null;
+        throw new IllegalStateException("Unexpected response structure or empty content");
+    }
+
+    private boolean isRetryable(Throwable error) {
+        if (error instanceof WebClientResponseException responseException) {
+            HttpStatusCode status = responseException.getStatusCode();
+            return status.value() == 429 || status.is5xxServerError();
+        }
+        return error instanceof WebClientRequestException
+                || error instanceof TimeoutException
+                || error instanceof IllegalStateException;
     }
 }

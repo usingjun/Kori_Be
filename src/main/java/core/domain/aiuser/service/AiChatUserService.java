@@ -20,6 +20,7 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
+import reactor.core.publisher.Mono;
 
 import java.security.SecureRandom;
 import java.time.Instant;
@@ -62,90 +63,97 @@ public class AiChatUserService {
     private final ThreadPoolTaskScheduler taskScheduler;
     private static final SecureRandom secureRandom = new SecureRandom();
 
-    public boolean processAiResponse(User aiUser, MessageCreatedEvent event, String combinedUserMessage, boolean isMainSpeaker) {
+    public Mono<Boolean> processAiResponse(User aiUser, MessageCreatedEvent event, String combinedUserMessage, boolean isMainSpeaker) {
         Long chatRoomId = event.messageResponse().roomId();
 
         if (JAILBREAK_PATTERN.matcher(combinedUserMessage).find()) {
             log.warn("AI Filtered Jailbreak: {}", combinedUserMessage);
-            return false;
+            return Mono.just(false);
         }
 
-        List<Map<String, Object>> requestMessages = transactionTemplate.execute(status -> {
-            return prepareAiContext(chatRoomId, aiUser, combinedUserMessage, isMainSpeaker);
-        });
+        List<Map<String, Object>> requestMessages;
+        try {
+            requestMessages = transactionTemplate.execute(status ->
+                    prepareAiContext(chatRoomId, aiUser, combinedUserMessage, isMainSpeaker)
+            );
+        } catch (Exception e) {
+            log.error("AI context preparation failed", e);
+            return Mono.just(false);
+        }
 
         if (requestMessages == null || requestMessages.isEmpty()) {
+            return Mono.just(false);
+        }
+
+        return aiClient.generateResponse(requestMessages)
+                .map(aiResponse -> scheduleResponseMessages(aiUser, chatRoomId, aiResponse))
+                .defaultIfEmpty(false)
+                .onErrorResume(error -> {
+                    log.error("AI API Call Failed", error);
+                    return Mono.just(false);
+                });
+    }
+
+    private boolean scheduleResponseMessages(User aiUser, Long chatRoomId, String aiResponse) {
+        if (aiResponse.isBlank()) {
+            log.warn("AI [{}] Response is empty or failed. Skipping.", aiUser.getFirstName());
             return false;
         }
 
-        try {
-            String aiResponse = aiClient.generateResponse(requestMessages);
+        if (AI_IDENTITY_PATTERN.matcher(aiResponse).find()) return false;
+        if (aiResponse.trim().toUpperCase().contains("PASS")) return false;
 
-            if (aiResponse == null || aiResponse.isBlank()) {
-                log.warn("AI [{}] Response is empty or failed. Skipping.", aiUser.getFirstName());
-                return false;
+        // 프롬프트 규칙(" || ")에 따라 메시지 분리
+        String[] splitMessages = aiResponse.split(" \\|\\| ");
+
+        long accumulatedDelay = 0; // 누적 딜레이 시간 (ms)
+        int scheduledCount = 0;    // 예약된 메시지 수
+
+        for (String part : splitMessages) {
+            // 한 턴에 최대 3개까지만 전송
+            if (scheduledCount >= 3) break;
+
+            String content = part.trim().replace("\"", "");
+            if (content.isBlank()) continue;
+
+            // ⏳ 딜레이 계산 로직 (Option 1: 글자 수 비례)
+            // 첫 번째 메시지는 즉시(0) 혹은 아주 짧게, 두 번째부터는 읽고 치는 시간 부여
+            if (scheduledCount > 0) {
+                // 1) 기본 인지 시간 (사람이 앞 메시지를 읽고 반응하는 최소 시간): 1.5초
+                long baseReactionTime = 1500;
+
+                // 2) 타자 시간 (한 글자당 약 120ms): 긴 문장은 오래 걸림
+                long typingTime = content.length() * 120L;
+
+                // 3) 인간적인 변수 (0~0.8초 랜덤)
+                long humanVariance = secureRandom.nextLong(0, 800);
+
+                // 총 딜레이 합산
+                long stepDelay = baseReactionTime + typingTime + humanVariance;
+
+                // * 너무 오래 걸리면 지루하므로 최대 6초로 제한 (Cap)
+                stepDelay = Math.min(stepDelay, 6000);
+
+                accumulatedDelay += stepDelay;
             }
 
-            if (AI_IDENTITY_PATTERN.matcher(aiResponse).find()) return false;
-            if (aiResponse.trim().toUpperCase().contains("PASS")) return false;
+            long delayForThisTask = accumulatedDelay;
 
-            // 프롬프트 규칙(" || ")에 따라 메시지 분리
-            String[] splitMessages = aiResponse.split(" \\|\\| ");
-
-            long accumulatedDelay = 0; // 누적 딜레이 시간 (ms)
-            int scheduledCount = 0;    // 예약된 메시지 수
-
-            for (String part : splitMessages) {
-                // 한 턴에 최대 3개까지만 전송
-                if (scheduledCount >= 3) break;
-
-                String content = part.trim().replace("\"", "");
-                if (content.isBlank()) continue;
-
-                // ⏳ 딜레이 계산 로직 (Option 1: 글자 수 비례)
-                // 첫 번째 메시지는 즉시(0) 혹은 아주 짧게, 두 번째부터는 읽고 치는 시간 부여
-                if (scheduledCount > 0) {
-                    // 1) 기본 인지 시간 (사람이 앞 메시지를 읽고 반응하는 최소 시간): 1.5초
-                    long baseReactionTime = 1500;
-
-                    // 2) 타자 시간 (한 글자당 약 120ms): 긴 문장은 오래 걸림
-                    long typingTime = content.length() * 120L;
-
-                    // 3) 인간적인 변수 (0~0.8초 랜덤)
-                    long humanVariance = secureRandom.nextLong(0, 800);
-
-                    // 총 딜레이 합산
-                    long stepDelay = baseReactionTime + typingTime + humanVariance;
-
-                    // * 너무 오래 걸리면 지루하므로 최대 6초로 제한 (Cap)
-                    stepDelay = Math.min(stepDelay, 6000);
-
-                    accumulatedDelay += stepDelay;
+            taskScheduler.schedule(() -> {
+                try {
+                    SendMessageRequest request = new SendMessageRequest(
+                            chatRoomId, aiUser.getId(), content, MessageType.TEXT
+                    );
+                    chatMessageService.processAndSendChatMessage(request);
+                } catch (Exception e) {
+                    log.error("Async AI Message Send Failed", e);
                 }
+            }, Instant.now().plusMillis(delayForThisTask));
 
-                long delayForThisTask = accumulatedDelay;
-
-                taskScheduler.schedule(() -> {
-                    try {
-                        SendMessageRequest request = new SendMessageRequest(
-                                chatRoomId, aiUser.getId(), content, MessageType.TEXT
-                        );
-                        chatMessageService.processAndSendChatMessage(request);
-                    } catch (Exception e) {
-                        log.error("Async AI Message Send Failed", e);
-                    }
-                }, Instant.now().plusMillis(delayForThisTask));
-
-                scheduledCount++;
-            }
-
-            // 하나라도 예약했으면 true 반환
-            return scheduledCount > 0;
-
-        } catch (Exception e) {
-            log.error("AI API Call Failed", e);
-            return false;
+            scheduledCount++;
         }
+
+        return scheduledCount > 0;
     }
 
     @Transactional(readOnly = true)
