@@ -30,6 +30,7 @@ ext {
 dependencies {
     // --- Spring ---
     implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
     implementation 'org.springframework.boot:spring-boot-starter-security'
     implementation 'org.springframework.boot:spring-boot-starter-oauth2-client'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
@@ -72,6 +73,7 @@ dependencies {
     testImplementation 'org.springframework.security:spring-security-test'
     testImplementation 'org.mockito:mockito-inline:5.2.0'
     testImplementation "org.junit.jupiter:junit-jupiter:5.10.3"
+    testImplementation 'io.projectreactor:reactor-test'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 
     // --- QueryDSL (Jakarta) ---
@@ -153,6 +155,7 @@ dependencyManagement {
 
 tasks.named('test') {
 	useJUnitPlatform()
+    systemProperty 'OPENAI_WEBCLIENT_BENCHMARK', System.getProperty('OPENAI_WEBCLIENT_BENCHMARK', 'false')
 
 	// core 2개로 병렬처리
     maxParallelForks = Runtime.runtime.availableProcessors().intdiv(2) ?: 1

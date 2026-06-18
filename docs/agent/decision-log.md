@@ -698,3 +698,32 @@ DLQ step을 직접 되돌리면 기존 시도 횟수와 실패 이력이 섞인�
 ### 변경 시 주의
 
 terminal session 삭제 배치는 RabbitMQ와 무관하게 실행되어야 한다. 보존기간 변경은 장애 조사에 필요한 이력 기간과 DB 용량을 함께 고려한다.
+
+## 29. OpenAI 호출만 WebClient 비동기 체인으로 전환한다
+
+### 결정
+
+- 전체 Spring MVC/JPA 구조는 유지하고 OpenAI Responses API 호출만 WebClient로 전환한다.
+- `AiClient.generateResponse()`부터 AI 메시지 예약까지 `Mono` 체인을 유지한다.
+- 호출부에서 `.block()`, `.get()`, `.join()`을 사용하지 않는다.
+- OpenAI connection은 최대 10개, pending 요청은 최대 100개로 제한한다.
+- 기존 최대 3회 시도와 1초/2초 backoff, connect 5초/response 60초 timeout은 유지한다.
+- 일반 4xx는 재시도하지 않고 429, 5xx, 네트워크/timeout, 응답 구조 오류만 재시도한다.
+
+### 이유
+
+기존 OpenAI 호출은 최대 60초 네트워크 대기와 `Thread.sleep()` 재시도 동안 scheduler
+worker를 점유했다. WebClient 요청 등록 후 worker를 반환하고 backoff도 non-blocking으로
+처리하면, 느린 OpenAI 응답이 공용 scheduler 작업 전체를 지연시키는 범위를 줄일 수 있다.
+
+전체 서버와 JPA를 reactive 구조로 바꾸는 것은 현재 문제 해결 범위를 크게 넘는다. OpenAI
+호출과 응답 후 처리만 비동기 체인으로 연결하면 기존 transaction 경계를 유지하면서 가장
+긴 외부 대기 구간의 thread 점유를 제거할 수 있다.
+
+### 변경 시 주의
+
+- WebClient를 사용해도 호출부에서 blocking wait를 하면 개선 효과가 사라진다.
+- Reactor event-loop에서 JPA, 메시지 저장 등 blocking 작업을 실행하지 않는다.
+- 동시 connection 제한을 높이면 OpenAI 429와 비용이 증가할 수 있으므로 측정 없이 늘리지 않는다.
+- thinking 상태는 요청 등록 직후가 아니라 비동기 publisher 종료 시점에 해제해야 한다.
+- 실제 OpenAI 장애와 부하 상황에서 pending queue, timeout, retry 동작을 추가 검증해야 한다.

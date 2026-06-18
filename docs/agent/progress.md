@@ -300,6 +300,20 @@ DB benchmark의 최초 구조와 최종 구조 비교:
 4. 최종 구조의 실제 NCP Copy benchmark와 Outbox 발행 지연을 측정한다.
 5. 결과에 따라 Outbox 즉시 발행 신호 적용 여부를 결정한다.
 
+OpenAI `RestTemplate` 호출의 장시간 thread 점유와 수동 retry 대기 문제, WebClient 전환 시
+필요한 비동기 호출 경계와 검증 계획은 `docs/agent/openai-webclient-improvement-plan.md`에
+기록했다. OpenAI 전용 WebClient와 non-blocking retry를 적용하고 `AiClient`부터 AI 메시지
+예약까지 `Mono` 체인으로 연결했다. 대상 단위 테스트는 통과했으며 실제 OpenAI 부하 측정은
+남아 있다. 최신 `./scripts/agent-check.sh`는 254개 중 기존 `pgroonga` extension 권한
+문제로 18개 실패, 5개 skip이다.
+
+OpenAI WebClient 전후 비교용 `OpenAiHttpClientConcurrencyBenchmarkTest`를 추가했다. 동일한
+750ms 지연, scheduler worker 10개, 동시 요청 10개 조건에서 전체 완료시간 중앙값은
+RestTemplate 755ms와 WebClient 759ms로 유사했다. scheduler probe 지연 중앙값은
+RestTemplate 751ms에서 WebClient 0ms로 감소했고, 느린 요청 뒤에 추가 제출한 빠른 작업
+50개의 p95 지연도 RestTemplate 751ms에서 WebClient 0ms로 감소했다. 외부 API 속도가 아니라
+대기 중 scheduler 점유, queue 적체, 후속 작업 연쇄 지연을 줄이는 개선임을 확인했다.
+
 생성·수정·삭제 모두 적용 대상이다. 다만 한 번에 전체 흐름을 변경하지 않고, 각 흐름별 실패 시나리오와 테스트를 확인하면서 점진 적용한다.
 
 ## 현재 구조 개선 체크
