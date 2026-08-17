@@ -727,3 +727,42 @@ worker를 점유했다. WebClient 요청 등록 후 worker를 반환하고 backo
 - 동시 connection 제한을 높이면 OpenAI 429와 비용이 증가할 수 있으므로 측정 없이 늘리지 않는다.
 - thinking 상태는 요청 등록 직후가 아니라 비동기 publisher 종료 시점에 해제해야 한다.
 - 실제 OpenAI 장애와 부하 상황에서 pending queue, timeout, retry 동작을 추가 검증해야 한다.
+
+## 30. 오래된 알림 삭제를 restart 가능한 Spring Batch Job으로 전환한다
+
+### 결정
+
+- 기존 오전 4시 cron과 JVM 기본 시간대를 유지한다.
+- Scheduler는 JobParameter 생성과 `JobLauncher` 호출만 담당한다.
+- Job은 단일 chunk Step으로 구성하고 chunk size는 기존 batch size와 같은 1,000으로 시작한다.
+- Reader는 알림 entity가 아닌 ID와 정렬 키만 JDBC keyset paging으로 읽는다.
+- 정렬 키는 `(created_at, notification_id)`이며 동일한 복합 인덱스를 추가한다.
+- Writer는 chunk ID를 하나의 `DELETE ... IN (...)` 쿼리로 삭제한다.
+- `scheduledDate`와 오전 4시 Instant 기준 168시간 전 `cutoff`를 모두 identifying
+  JobParameter로 사용한다.
+- Spring Batch metadata schema와 notification cleanup index는 Flyway가 관리한다.
+- 인스턴스들이 동일 PostgreSQL을 공유한다는 전제에서 JobRepository로 중복 실행을 막는다.
+- 기존 batch 사이 `Thread.sleep(1000)`은 근거가 확인되지 않아 제거한다.
+
+지역 날짜에서 `minusDays(7)`을 먼저 적용하면 DST 전환이 있는 JVM 시간대에서 기존
+`Instant.now().minus(7일)`과 한 시간 차이가 날 수 있다. 따라서 scheduledDate 오전 4시를
+Instant로 변환한 후 정확히 168시간을 빼 기존 retention 의미를 유지한다.
+
+### 이유
+
+기존 `deleteBatch()`의 `@Transactional`은 같은 bean 내부 호출이어서 적용되지 않았고 조회와
+삭제가 하나의 명시적 transaction 경계에 있지 않았다. 또한 실패 상태와 처리 위치가 로그에만
+남아 다음 실행에서 처음부터 다시 시작했다. Spring Batch chunk transaction은 데이터 삭제와
+StepExecution/ExecutionContext checkpoint를 함께 commit하므로 실패한 chunk만 rollback하고
+마지막 성공 checkpoint부터 restart할 수 있다.
+
+삭제 중 offset paging은 앞 페이지 삭제로 결과가 당겨지면서 항목을 건너뛸 수 있다. 복합
+정렬 키 기반 keyset paging은 마지막으로 commit된 키 이후부터 읽으므로 삭제와 restart에 모두
+안정적이다.
+
+### 변경 시 주의
+
+- 모든 운영 인스턴스의 JVM 기본 시간대가 같아야 동일 scheduledDate/cutoff가 생성된다.
+- 운영 인스턴스가 서로 다른 PostgreSQL을 사용하면 JobRepository 기반 중복 방지는 적용되지 않는다.
+- metadata migration이 적용되기 전에 애플리케이션이 오전 4시 Job을 시작하면 실행이 실패한다.
+- chunk size나 별도 throttling은 실제 DB 부하를 측정한 뒤 변경한다.

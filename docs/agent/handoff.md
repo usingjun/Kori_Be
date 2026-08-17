@@ -292,3 +292,35 @@ Presigned URL 발급
 2. 실제 NCP 환경에서 `HeadObject → ISSUED → CLAIMED → REGISTERED` 흐름을 검증한다.
 3. 만료 Outbox, 삭제 실패 재처리, terminal session 삭제를 실제 환경에서 확인한다.
 4. 기존 `temp/` key fallback 제거 시점을 결정한다.
+
+## Notification Cleanup Spring Batch
+
+오래된 알림 삭제는 기존 수동 Scheduler loop에서 Spring Batch로 전환됐다.
+상세 계획과 설계 근거는 `docs/agent/notification-cleanup-spring-batch-plan.md`를 확인한다.
+
+```text
+04:00 Scheduler
+→ JobLauncher(notificationCleanupJob, scheduledDate + cutoff)
+→ JobRepository가 JobInstance/JobExecution 생성 또는 중복 차단
+→ notificationCleanupStep
+→ JdbcPagingItemReader<Long> keyset paging
+→ 1,000건 chunk bulk delete
+→ StepExecution + ExecutionContext checkpoint commit
+```
+
+핵심 파일:
+
+- `core.domain.notification.batch.NotificationCleanupScheduler`
+- `core.domain.notification.batch.NotificationCleanupJobConfig`
+- `core.domain.notification.batch.NotificationCleanupItemWriter`
+- `core.domain.notification.batch.NotificationCleanupJobExecutionListener`
+- `V202608170100__create_spring_batch_metadata.sql`
+- `V202608170200__add_notification_cleanup_index.sql`
+
+오전 4시 cron, JVM 기본 시간대, 정확한 168시간 retention은 유지한다. `Thread.sleep(1000)`은 제거했고
+chunk size는 1,000이다. 같은 scheduledDate와 cutoff는 동일 JobInstance이므로 공유 PostgreSQL의
+JobRepository가 다중 인스턴스 중복 실행을 막는다. 실패 restart는 동일 parameter를 사용해야 하며
+Reader의 ExecutionContext에 저장된 `(created_at, notification_id)` checkpoint 이후부터 이어진다.
+
+신규 target 테스트 12개는 모두 통과했다. 최신 전체 검증은 299개 중 18개 실패, 5개 skip이며,
+18개 실패는 기존 `pgroonga` extension 권한 문제다.
