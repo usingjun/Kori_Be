@@ -351,3 +351,27 @@ RestTemplate 751ms에서 WebClient 0ms로 감소했고, 느린 요청 뒤에 추
 | `3421eeb6` | 이미지 operation/step 상태 Batch 저장 |
 | `abbfbce5` | NCP Copy와 Image DB transaction 경계 분리 |
 | `b8022509` | 상위 transaction commit 이후 이미지 비동기 작업 제출 |
+
+## Notification Cleanup Spring Batch 전환
+
+- 상세 구현 계획과 설계 기준은 `docs/agent/notification-cleanup-spring-batch-plan.md`에 기록했다.
+- 기존 `NotificationCleanupService`의 `while` 반복, self-invocation `@Transactional`,
+  `Thread.sleep(1000)` 기반 정리를 제거했다.
+- 오전 4시 cron과 JVM 기본 시간대, 7일 보존 기준은 유지했다.
+- `notificationCleanupJob`의 단일 `notificationCleanupStep`이 cutoff 이전 알림 ID를
+  `(created_at, notification_id)` keyset paging으로 읽고 1,000건 chunk 단위로 bulk 삭제한다.
+- cutoff와 scheduledDate를 identifying JobParameter로 사용해 같은 날짜의 실행을 동일
+  JobInstance로 식별한다.
+- Spring Batch metadata는 Flyway가 관리하며 애플리케이션 시작 시 Job 자동 실행과 Batch
+  schema 자동 생성을 비활성화했다.
+- `(created_at, notification_id)` cleanup index를 concurrent migration으로 추가했다.
+- target 단위·통합 테스트에서 multi-chunk, cutoff 경계, chunk rollback, checkpoint restart,
+  완료된 JobInstance 중복 실행 차단을 확인했다.
+- self-review에서 지역 날짜 `minusDays(7)`이 DST 시간대에서 기존 168시간 retention과
+  달라질 수 있음을 발견해, 오전 4시 Instant에서 정확히 168시간을 빼도록 수정하고 DST
+  회귀 테스트를 추가했다.
+- 동일 JobInstance의 동시 launch를 실제 공유 PostgreSQL JobRepository에서 차단하는 통합
+  테스트를 추가했다.
+- 최신 `./scripts/agent-check.sh`는 299개 중 18개 실패, 5개 skip이다. 18개 실패는 모두
+  기존 `pgroonga` extension 생성 권한 문제이며 Notification Batch 관련 테스트는 통과했다.
+  test 실패로 스크립트가 중단되어 JaCoCo report 단계는 실행되지 않았다.
